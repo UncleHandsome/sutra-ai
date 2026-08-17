@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-refine.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具
+sutra.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具
 （雙標點體系全能版 + DeepSeek Prompt Cache 極致優化 + 模組化重構版）
 
 支援雙標點體系：
@@ -16,13 +16,13 @@ refine.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏
   ★ 支援斷點續傳（Checkpoint）與 Windows / OneDrive 檔案鎖容錯機制
 
 用法：
-  python refine.py --file 1.txt --generate          # ★ 全本銷文模式（將整篇經文視為大漏段，AI自主推進從頭銷文到尾）
-  python refine.py --file 1.txt --auto              # ★ 官方 DeepSeek 一鍵全流程（審查+修復+重排）
-  python refine.py --file 1.txt --fix-gaps          # ★ 專注補漏模式（快速掃描漏段，AI自主分段補齊並物理歸位）
-  python refine.py --file 1.txt --auto --opencode   # ★ 使用 OpenCode Go (opencode.ai) 端點
-  python refine.py --file 1.txt --review --opencode # 使用 OpenCode 僅審查並產出 review.json
-  python refine.py --file 1.txt --fix --opencode    # 使用 OpenCode 依 review.json 修正
-  python refine.py --file 1.txt --fix --dry-run     # 預覽待修正清單（不呼叫 API）
+  python sutra.py --file 1.txt --generate          # ★ 全本銷文模式（將整篇經文視為大漏段，AI自主推進從頭銷文到尾）
+  python sutra.py --file 1.txt --auto              # ★ 官方 DeepSeek 一鍵全流程（審查+修復+重排）
+  python sutra.py --file 1.txt --fix-gaps          # ★ 專注補漏模式（快速掃描漏段，AI自主分段補齊並物理歸位）
+  python sutra.py --file 1.txt --auto --opencode   # ★ 使用 OpenCode Go (opencode.ai) 端點
+  python sutra.py --file 1.txt --review --opencode # 使用 OpenCode 僅審查並產出 review.json
+  python sutra.py --file 1.txt --fix --opencode    # 使用 OpenCode 依 review.json 修正
+  python sutra.py --file 1.txt --fix --dry-run     # 預覽待修正清單（不呼叫 API）
 """
 
 import os
