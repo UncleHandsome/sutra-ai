@@ -15,6 +15,7 @@ refine.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏
   ★ 支援斷點續傳（Checkpoint）與 Windows / OneDrive 檔案鎖容錯機制
 
 用法：
+  python refine.py --file 1.txt --generate          # ★ 全本銷文模式（將整篇經文視為大漏段，AI自主推進從頭銷文到尾）
   python refine.py --file 1.txt --auto              # ★ 官方 DeepSeek 一鍵全流程（審查+修復+重排）
   python refine.py --file 1.txt --fix-gaps          # ★ 專注補漏模式（快速掃描漏段，AI自主分段補齊並物理歸位）
   python refine.py --file 1.txt --auto --opencode   # ★ 使用 OpenCode Go (opencode.ai) 端點
@@ -1079,12 +1080,16 @@ def generate_sutra_segments(
                     if cut_idx < len(remaining_text):
                         remaining_text = remaining_text[cut_idx:].strip()
                         remaining_text = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉\s　]+", "", remaining_text).strip()
-                        # 安全防護：若剩餘開頭殘留 <=2 個字且緊接標點（如「者。」「也。」），自動吸納清除避免下一輪卡死
+                        # 安全防護：若剩餘開頭殘留 <=2 個純虛詞/標點殘肢，自動吸納清除避免卡在單個字
                         rem_clean = normalize_text(remaining_text)
-                        if 0 < len(rem_clean) <= 2:
+                        if 0 < len(rem_clean) <= 2 and any(rem_clean.endswith(p) for p in ["者", "也", "耳", "矣", "焉"]):
                             remaining_text = ""
                     else:
                         remaining_text = ""
+                else:
+                    # 若無法精準定位切點，判定為對齊異常，記錄警報並安全中斷，絕不盲目硬切經文
+                    logger.error(f"    ❌ 指針對齊失敗：無法在剩餘經文中定位『{norm_sent[:15]}...』的精確結尾，終止自動推進以防跳字。")
+                    break
 
             logger.info(f"    ✅ 子單元銷文成功：『{extracted_sent[:25]}...』(剩餘 {len(normalize_text(remaining_text))} 字)")
             if len(normalize_text(remaining_text)) > 0:
@@ -1738,6 +1743,91 @@ def remove_checkpoint(checkpoint_path: str) -> None:
 # ============================================================
 #  八、業務工作流：補漏模式、審查模式、修正模式、一鍵全自動
 # ============================================================
+def run_generate(
+    args: argparse.Namespace,
+    client: OpenAI,
+    model: str,
+    sutra_text: str,
+    output_path: str,
+    logger: logging.Logger
+) -> None:
+    """★ 全本全新銷文模式（將全篇原始經文視為目標任務，AI 自主逐段推進產出，支援中斷接續）"""
+    logger.info("=" * 65)
+    logger.info(f"🚀 啟動全本經文銷文 (Generate) 模式：{output_path}")
+    logger.info("=" * 65)
+
+    existing_segments = extract_segments_from_md(output_path) if os.path.exists(output_path) else []
+    
+    # 若檔案已有部分內容，自動對齊全域覆蓋，僅針對尚未完成的區段推進（具備斷點接續能力）
+    missing_gaps = find_missing_gaps(sutra_text, existing_segments)
+    if not missing_gaps:
+        logger.info("✅ 經文覆蓋率已達 100%，全文皆已銷文完畢，無須重複生成！")
+        return
+
+    logger.info(f"📖 待處理經文共 {len(missing_gaps)} 個區間（總計 {sum(len(normalize_text(g['gap_text'])) for g in missing_gaps)} 字），開始逐段推進...")
+    total_added_blocks = 0
+
+    for gap_i, g in enumerate(missing_gaps, 1):
+        gap_raw = g["gap_text"].strip()
+        p_idx = g["prev_idx"]
+        prev_sentence = existing_segments[p_idx] if (existing_segments and 0 <= p_idx < len(existing_segments)) else ""
+
+        logger.info(f"\n[{gap_i}/{len(missing_gaps)}] 正在銷文（長度 {len(normalize_text(gap_raw))} 字）：『{gap_raw[:30]}...』")
+
+        def block_success_handler(block_content: str, sent: str):
+            nonlocal total_added_blocks, prev_sentence
+            total_added_blocks += 1
+            prev_sentence = sent
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                with open(output_path, "a", encoding="utf-8") as f:
+                    f.write("\n\n---\n\n" + block_content)
+            else:
+                base_name = os.path.splitext(os.path.basename(output_path))[0].replace("_銷文", "")
+                header_prefix = f"# 佛經銷文：{base_name}\n\n"
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(header_prefix + block_content)
+            header, cur_sections = parse_md_sections(output_path)
+            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(cur_sections)
+            reordered_md = reorder_markdown_by_sutra(cur_body, sutra_text)
+            safe_write_file(output_path, reordered_md)
+
+        blocks, rem_after = generate_sutra_segments(
+            client=client,
+            model=model,
+            sutra_text=sutra_text,
+            target_raw_text=gap_raw,
+            prev_sentence=prev_sentence,
+            logger=logger,
+            issue_type="全本經文銷文",
+            problem_desc="",
+            reasoning_effort=args.reasoning_effort,
+            on_block_success=block_success_handler
+        )
+
+        if not blocks or (rem_after and len(normalize_text(rem_after)) > 2):
+            logger.error(f"  ❌ 經文推進於『{gap_raw[:20]}...』處中斷。")
+            break
+
+        existing_segments = extract_segments_from_md(output_path)
+
+    # 計算最終覆蓋率
+    latest_segments = extract_segments_from_md(output_path)
+    final_gaps = find_missing_gaps(sutra_text, latest_segments)
+    clean_sutra_len = len(normalize_text(sutra_text))
+    total_gaps_chars = sum(len(normalize_text(g["gap_text"])) for g in final_gaps)
+    covered_chars = max(0, clean_sutra_len - total_gaps_chars)
+    coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
+
+    logger.info("\n" + "=" * 65)
+    logger.info(f"🎉 全本銷文執行完畢！本次共產出 {total_added_blocks} 個段落。")
+    logger.info(f"📊 經文總覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
+    if final_gaps:
+        logger.warning(f"⚠️ 尚有 {len(final_gaps)} 處未完成區段，再次執行本指令即可接續推進。")
+    else:
+        logger.info("🎉 經文已 100% 銷文完畢！")
+    logger.info("=" * 65)
+
+
 def run_fix_gaps(
     args: argparse.Namespace,
     client: OpenAI,
@@ -2156,6 +2246,7 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（模組化重構版）")
     parser.add_argument("--file", type=str, required=True, help="原始經文 txt 檔案路徑")
     parser.add_argument("--output", type=str, default=None, help="目標銷文 md 檔案路徑（預設自動推導）")
+    parser.add_argument("--generate", "--gen", action="store_true", help="★ 全本從頭銷文模式（將全篇經文視為大漏段，AI自主逐段推進產出）")
     parser.add_argument("--auto", action="store_true", help="★ 一鍵全流程（審查 + 修正 + 重排）")
     parser.add_argument("--fix-gaps", "--gaps", action="store_true", help="★ 專注補漏模式（快速掃描漏段，AI自主分段補齊並物理歸位）")
     parser.add_argument("--review", action="store_true", help="僅執行審查並輸出 review.json")
@@ -2172,12 +2263,12 @@ def main():
     parser.add_argument("--api-key-file", type=str, default=None, help="指定 API Key 檔案路徑")
     args = parser.parse_args()
 
-    if not args.auto and not args.review and not args.fix and not args.fix_gaps and not args.dry_run:
-        print("請指定運作模式：--auto（一鍵全流程）、--fix-gaps（專注補漏）、--review（僅審查）、--fix（依報告修正）或 --dry-run（預覽待修清單）")
+    if not args.auto and not args.review and not args.fix and not args.fix_gaps and not args.dry_run and not args.generate:
+        print("請指定運作模式：--generate（全本銷文）、--auto（一鍵全流程）、--fix-gaps（專注補漏）、--review（僅審查）、--fix（依報告修正）或 --dry-run（預覽待修清單）")
         return
 
     # 若單獨使用 --dry-run，自動視為 --fix --dry-run
-    if args.dry_run and not args.auto and not args.review and not args.fix_gaps:
+    if args.dry_run and not args.auto and not args.review and not args.fix_gaps and not args.generate:
         args.fix = True
 
     if args.output is None:
@@ -2195,7 +2286,7 @@ def main():
 
     style = detect_punctuation_style(sutra_text)
     segments = extract_segments_from_md(args.output)
-    if not segments and not args.fix_gaps:
+    if not segments and not args.fix_gaps and not args.generate:
         logger.error(f"無法從銷文檔 {args.output} 提取到任何「🔹 原典」段落，請確認檔案路徑。")
         return
 
@@ -2221,7 +2312,9 @@ def main():
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.timeout)
 
     # 根據不同模式呼叫專屬控制器
-    if args.fix_gaps:
+    if args.generate:
+        run_generate(args, client, args.model, sutra_text, args.output, logger)
+    elif args.fix_gaps:
         run_fix_gaps(args, client, args.model, sutra_text, segments, style, args.output, logger)
     elif args.auto:
         run_auto(args, client, args.model, sutra_text, segments, style, args.output, logger)
