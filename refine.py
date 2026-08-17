@@ -32,6 +32,7 @@ import time
 import shutil
 import logging
 import argparse
+from enum import Enum
 from typing import List, Dict, Tuple, Optional, Any, Callable
 from openai import OpenAI
 
@@ -129,6 +130,9 @@ def clean_markdown_content(raw_content: str) -> str:
     text = raw_content.strip()
     # 0. 移除 DeepSeek R1 / 推理模型思維鏈標籤 (<think>...</think>)
     text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    # 防禦：若思維鏈未正常閉合，清除 <think> 及其後所有殘留
+    if "<think>" in text.lower():
+        text = re.sub(r"<think>[\s\S]*", "", text, flags=re.IGNORECASE).strip()
     # 1. 移除寒暄問候
     text = re.sub(r"^(?:阿彌陀佛[。，！\s]*|施主[^\n]*\n*|好的[，。]我們現在[^\n]*\n*)*", "", text, flags=re.IGNORECASE)
     # 2. 徹底移除【當前經文進度】（相容 ### 、 ** 、 # 等各類 Markdown 標題前綴）
@@ -154,13 +158,15 @@ def clean_markdown_content(raw_content: str) -> str:
 
 
 def extract_sentence(raw_content: str) -> Optional[str]:
-    """精確提取『🔹 原典』中的文字（自動清除外圍代碼塊、引號與孤立標點符號殘肢）"""
+    """精確提取『🔹 原典』中的文字（自動清除外圍代碼塊、引號、Markdown 粗體與孤立標點符號殘肢）"""
     def _clean_s(t: str) -> str:
         t = t.strip()
-        t = re.sub(r"^[`\s]+|[`\s]+$", "", t).strip()
-        t = re.sub(r"^[「『\"\'“]+|[」』\"\'”]+$", "", t).strip()
-        t = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉\s]+", "", t).strip()
-        t = re.sub(r"[（\(\[【〔＜《〈\s]+$", "", t).strip()
+        # 循環剝除外層的 Markdown 粗體、行內代碼、引號與括號殘片
+        for _ in range(3):
+            t = re.sub(r"^[`*_\s]+|[`*_\s]+$", "", t).strip()
+            t = re.sub(r"^[「『\"\'“‘《〈【〔（(]+|[」』\"\'”’》〉】〕）)]+$", "", t).strip()
+            t = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉\s]+", "", t).strip()
+            t = re.sub(r"[（\(\[【〔＜《〈\s]+$", "", t).strip()
         return t
 
     m = re.search(r"🔹\s*(?:\*\*|#)*\s*原典\s*(?:\*\*)*[：:]\s*([\s\S]*?)(?=(?:\n\s*🔸|\n\s*【|$))", raw_content)
@@ -193,13 +199,13 @@ def is_ignorable_gap(gap_text: str) -> bool:
 
 
 def validate_output_format(raw_content: str) -> Tuple[bool, List[str]]:
-    """驗證輸出格式是否包含全部必備結構"""
+    """驗證輸出格式是否包含全部必備結構（相容 Unicode 符號、Markdown 標題與粗體）"""
     required_sections = [
-        ("🔹 原典", r"🔹\s*(?:\*\*)*\s*原典|(?:\*\*)*\s*原典\s*(?:\*\*)*[：:]"),
-        ("🔸 釋詞", r"🔸\s*(?:\*\*)*\s*釋詞|(?:\*\*)*\s*釋詞\s*(?:\*\*)*[：:]"),
-        ("🔸 銷文", r"🔸\s*(?:\*\*)*\s*銷文|(?:\*\*)*\s*銷文\s*(?:\*\*)*[：:]"),
-        ("【詳解】", r"【詳解】"),
-        ("【義理通解】", r"【義理通解】"),
+        ("🔹 原典", r"🔹\s*(?:\*\*|#)*\s*原典|(?:\*\*|#)*\s*原典\s*(?:\*\*)*[：:]|【原典】"),
+        ("🔸 釋詞", r"🔸\s*(?:\*\*|#)*\s*釋詞|(?:\*\*|#)*\s*釋詞\s*(?:\*\*)*[：:]|【釋詞】"),
+        ("🔸 銷文", r"🔸\s*(?:\*\*|#)*\s*銷文|(?:\*\*|#)*\s*銷文\s*(?:\*\*)*[：:]|【銷文】"),
+        ("【詳解】", r"【詳解】|###\s*詳解|(?:\*\*)*\s*詳解\s*(?:\*\*)*[：:]"),
+        ("【義理通解】", r"【義理通解】|###\s*義理通解|(?:\*\*)*\s*義理通解\s*(?:\*\*)*[：:]"),
     ]
     missing = [name for name, pat in required_sections if not re.search(pat, raw_content)]
     return (len(missing) == 0), missing
@@ -379,6 +385,10 @@ def find_missing_gaps(sutra_text: str, completed_sentences: List[str]) -> List[D
             gap_end_clean = i
 
             gap_start_raw = clean_to_raw_map[gap_start_clean]
+            # 向左擴展，完整包含漏段開頭可能存在的引號或括號（如「『《）
+            while gap_start_raw > 0 and sutra_text[gap_start_raw - 1] in "「『“‘（([【〔<《〈":
+                gap_start_raw -= 1
+
             if gap_end_clean < len(clean_to_raw_map):
                 gap_end_raw = clean_to_raw_map[gap_end_clean]
                 while gap_end_raw > gap_start_raw and sutra_text[gap_end_raw - 1] in "「『“‘（([【〔<《〈":
@@ -600,7 +610,7 @@ def extract_segments_from_md(filepath: str) -> List[str]:
     """從 MD 檔案中依序提取出所有原典段落"""
     if not os.path.exists(filepath):
         return []
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8-sig") as f:
         content = f.read()
 
     raw_matches = re.findall(r"🔹\s*(?:\*\*|#)*\s*原典\s*(?:\*\*)*[：:]\s*([\s\S]*?)(?=(?:\n\s*🔸|\n\s*【|\n---|$))", content)
@@ -621,7 +631,7 @@ def parse_md_sections(filepath: str) -> Tuple[str, List[str]]:
     """將 MD 拆解為大標題與段落獨立區塊，自動黏合孤立殘片"""
     if not os.path.exists(filepath):
         return "", []
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8-sig") as f:
         content = f.read()
 
     header = ""
@@ -1079,7 +1089,7 @@ def generate_sutra_segments(
                 if cut_idx != -1:
                     if cut_idx < len(remaining_text):
                         remaining_text = remaining_text[cut_idx:].strip()
-                        remaining_text = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉\s　]+", "", remaining_text).strip()
+                        remaining_text = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉」』”’\'\"\s　]+", "", remaining_text).strip()
                         # 安全防護：若剩餘開頭殘留 <=2 個純虛詞/標點殘肢，自動吸納清除避免卡在單個字
                         rem_clean = normalize_text(remaining_text)
                         if 0 < len(rem_clean) <= 2 and any(rem_clean.endswith(p) for p in ["者", "也", "耳", "矣", "焉"]):
@@ -1552,86 +1562,100 @@ def ai_review(
 
     logger.info(f"AI 審查：正在進行全局語意流暢度與因明攻防邏輯校驗（共 {len(segments)} 段）...")
 
-    try:
-        create_kwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": REVIEW_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            "max_tokens": 384000,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if reasoning_effort:
-            create_kwargs["extra_body"] = {
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": reasoning_effort,
+    for retry in range(3):
+        try:
+            create_kwargs = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": REVIEW_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                "max_tokens": 384000,
+                "stream": True,
+                "stream_options": {"include_usage": True},
             }
+            if reasoning_effort:
+                create_kwargs["extra_body"] = {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": reasoning_effort,
+                }
 
-        try:
-            resp = client.chat.completions.create(**create_kwargs)
-        except Exception as api_err:
-            if "extra_body" in create_kwargs:
-                create_kwargs.pop("extra_body", None)
+            try:
                 resp = client.chat.completions.create(**create_kwargs)
-            else:
-                raise api_err
+            except Exception as api_err:
+                if "extra_body" in create_kwargs:
+                    create_kwargs.pop("extra_body", None)
+                    resp = client.chat.completions.create(**create_kwargs)
+                else:
+                    raise api_err
 
-        content_parts = []
-        last_chunk = None
-        for chunk in resp:
-            last_chunk = chunk
-            if chunk.choices and chunk.choices[0].delta.content:
-                content_parts.append(chunk.choices[0].delta.content)
+            content_parts = []
+            last_chunk = None
+            for chunk in resp:
+                last_chunk = chunk
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content_parts.append(chunk.choices[0].delta.content)
 
-        if last_chunk:
-            log_cache_metrics(logger, last_chunk, action_name="AI 斷句審查")
+            if last_chunk:
+                log_cache_metrics(logger, last_chunk, action_name="AI 斷句審查")
 
-        text = "".join(content_parts).strip()
-        text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.MULTILINE).strip()
+            text = "".join(content_parts).strip()
+            # 清理推理標籤與 Markdown 代碼塊
+            text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
+            text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.MULTILINE).strip()
+            # 容錯：去除 JSON 尾端非法的逗號 (Trailing Commas)
+            text = re.sub(r",\s*([\]}])", r"\1", text)
 
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\[[\s\S]*\]", text)
-            parsed = json.loads(m.group()) if m else []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                m = re.search(r"\[[\s\S]*\]", text)
+                if m:
+                    clean_m = re.sub(r",\s*([\]}])", r"\1", m.group())
+                    parsed = json.loads(clean_m)
+                else:
+                    parsed = []
 
-        if isinstance(parsed, dict):
-            for k in ["issues", "data", "result", "problems"]:
-                if k in parsed and isinstance(parsed[k], list):
-                    issues = parsed[k]
-                    break
+            if isinstance(parsed, dict):
+                for k in ["issues", "data", "result", "problems"]:
+                    if k in parsed and isinstance(parsed[k], list):
+                        issues = parsed[k]
+                        break
+                else:
+                    issues = []
+            elif isinstance(parsed, list):
+                issues = parsed
             else:
                 issues = []
-        elif isinstance(parsed, list):
-            issues = parsed
-        else:
-            issues = []
 
-        valid_issues = []
-        max_idx = len(segments) - 1
-        for iss in issues:
-            raw_merge = iss.get("merge_indices", [iss.get("index", -1)])
-            filtered_merge = [idx for idx in raw_merge if isinstance(idx, int) and 0 <= idx <= max_idx]
-            if filtered_merge:
-                iss["index"] = filtered_merge[0]
-                iss["merge_indices"] = sorted(list(set(filtered_merge)))
-                valid_issues.append(iss)
+            valid_issues = []
+            max_idx = len(segments) - 1
+            for iss in issues:
+                raw_merge = iss.get("merge_indices", [iss.get("index", -1)])
+                filtered_merge = [idx for idx in raw_merge if isinstance(idx, int) and 0 <= idx <= max_idx]
+                if filtered_merge:
+                    iss["index"] = filtered_merge[0]
+                    iss["merge_indices"] = sorted(list(set(filtered_merge)))
+                    valid_issues.append(iss)
 
-        logger.info(f"AI 審查完成：檢出 {len(valid_issues)} 處有效邏輯割裂或斷句不當之處（已過濾 {len(issues) - len(valid_issues)} 處越界幻覺）")
-        return valid_issues
-    except KeyboardInterrupt:
-        logger.warning("\n🛑 使用者中斷了 AI 審查流程 (Ctrl+C)")
-        raise
-    except Exception as e:
-        err_msg = str(e)
-        if any(kw in err_msg for kw in ["Insufficient balance", "CreditsError", "AuthenticationError", "invalid_api_key", "401"]):
-            logger.error("❌ API 金鑰無效或帳號餘額不足！請至平台儲值或更換 API Key。")
-        else:
-            logger.error(f"AI 審查異常: {e}")
-        return None
+            logger.info(f"AI 審查完成：檢出 {len(valid_issues)} 處有效邏輯割裂或斷句不當之處（已過濾 {len(issues) - len(valid_issues)} 處越界幻覺）")
+            return valid_issues
+
+        except KeyboardInterrupt:
+            logger.warning("\n🛑 使用者中斷了 AI 審查流程 (Ctrl+C)")
+            raise
+        except Exception as e:
+            err_msg = str(e)
+            if any(kw in err_msg for kw in ["Insufficient balance", "CreditsError", "AuthenticationError", "invalid_api_key", "401"]):
+                logger.error("❌ API 金鑰無效或帳號餘額不足！請至平台儲值或更換 API Key。")
+                return None
+            backoff = (retry + 1) * 3
+            logger.error(f"  ❌ AI 審查呼叫失敗 ({e})，等待 {backoff} 秒後進行第 {retry+1}/3 次重試...")
+            time.sleep(backoff)
+
+    logger.error("❌ AI 審查重試 3 次皆失敗，放棄本次審查。")
+    return None
 
 
 def merge_overlapping_issues(issues: List[Dict[str, Any]], max_valid_len: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1743,28 +1767,38 @@ def remove_checkpoint(checkpoint_path: str) -> None:
 # ============================================================
 #  八、業務工作流：補漏模式、審查模式、修正模式、一鍵全自動
 # ============================================================
-def run_generate(
+def run_fill_gaps(
     args: argparse.Namespace,
     client: OpenAI,
     model: str,
     sutra_text: str,
     output_path: str,
-    logger: logging.Logger
+    logger: logging.Logger,
+    mode_title: str = "經文補漏 (Gap Fill)",
+    issue_type: str = "經文漏段補齊"
 ) -> None:
-    """★ 全本全新銷文模式（將全篇原始經文視為目標任務，AI 自主逐段推進產出，支援中斷接續）"""
+    """★ 統一經文推進引擎（數學本質：從零銷文 ≡ 遺漏率 100% 的補漏）"""
     logger.info("=" * 65)
-    logger.info(f"🚀 啟動全本經文銷文 (Generate) 模式：{output_path}")
+    logger.info(f"🚀 啟動 {mode_title} 模式：{output_path}")
     logger.info("=" * 65)
 
+    # 預先校準已存在的 MD 結構
+    if os.path.exists(output_path):
+        header, sections = parse_md_sections(output_path)
+        if sections:
+            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(sections)
+            reordered = reorder_markdown_by_sutra(cur_body, sutra_text)
+            safe_write_file(output_path, reordered)
+
     existing_segments = extract_segments_from_md(output_path) if os.path.exists(output_path) else []
-    
-    # 若檔案已有部分內容，自動對齊全域覆蓋，僅針對尚未完成的區段推進（具備斷點接續能力）
     missing_gaps = find_missing_gaps(sutra_text, existing_segments)
+    
     if not missing_gaps:
         logger.info("✅ 經文覆蓋率已達 100%，全文皆已銷文完畢，無須重複生成！")
         return
 
-    logger.info(f"📖 待處理經文共 {len(missing_gaps)} 個區間（總計 {sum(len(normalize_text(g['gap_text'])) for g in missing_gaps)} 字），開始逐段推進...")
+    total_gap_chars = sum(len(normalize_text(g["gap_text"])) for g in missing_gaps)
+    logger.info(f"📖 待處理經文共 {len(missing_gaps)} 個區間（總計 {total_gap_chars} 字），開始逐段推進...")
     total_added_blocks = 0
 
     for gap_i, g in enumerate(missing_gaps, 1):
@@ -1772,22 +1806,18 @@ def run_generate(
         p_idx = g["prev_idx"]
         prev_sentence = existing_segments[p_idx] if (existing_segments and 0 <= p_idx < len(existing_segments)) else ""
 
-        logger.info(f"\n[{gap_i}/{len(missing_gaps)}] 正在銷文（長度 {len(normalize_text(gap_raw))} 字）：『{gap_raw[:30]}...』")
+        logger.info(f"\n[{gap_i}/{len(missing_gaps)}] 正在推進銷文（長度 {len(normalize_text(gap_raw))} 字）：『{gap_raw[:30]}...』")
 
         def block_success_handler(block_content: str, sent: str):
             nonlocal total_added_blocks, prev_sentence
             total_added_blocks += 1
             prev_sentence = sent
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                with open(output_path, "a", encoding="utf-8") as f:
-                    f.write("\n\n---\n\n" + block_content)
-            else:
+            header, cur_sections = parse_md_sections(output_path) if os.path.exists(output_path) else ("", [])
+            if not header:
                 base_name = os.path.splitext(os.path.basename(output_path))[0].replace("_銷文", "")
-                header_prefix = f"# 佛經銷文：{base_name}\n\n"
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(header_prefix + block_content)
-            header, cur_sections = parse_md_sections(output_path)
-            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(cur_sections)
+                header = f"# 佛經銷文：{base_name}\n\n"
+            cur_sections.append(block_content)
+            cur_body = (header.strip() + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(cur_sections)
             reordered_md = reorder_markdown_by_sutra(cur_body, sutra_text)
             safe_write_file(output_path, reordered_md)
 
@@ -1798,7 +1828,7 @@ def run_generate(
             target_raw_text=gap_raw,
             prev_sentence=prev_sentence,
             logger=logger,
-            issue_type="全本經文銷文",
+            issue_type=issue_type,
             problem_desc="",
             reasoning_effort=args.reasoning_effort,
             on_block_success=block_success_handler
@@ -1808,9 +1838,10 @@ def run_generate(
             logger.error(f"  ❌ 經文推進於『{gap_raw[:20]}...』處中斷。")
             break
 
+        # 即時提取最新段落快照，確保下一段漏段的「前文脈絡錨點」無縫銜接
         existing_segments = extract_segments_from_md(output_path)
 
-    # 計算最終覆蓋率
+    # 計算最終覆蓋率指標
     latest_segments = extract_segments_from_md(output_path)
     final_gaps = find_missing_gaps(sutra_text, latest_segments)
     clean_sutra_len = len(normalize_text(sutra_text))
@@ -1819,13 +1850,31 @@ def run_generate(
     coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
 
     logger.info("\n" + "=" * 65)
-    logger.info(f"🎉 全本銷文執行完畢！本次共產出 {total_added_blocks} 個段落。")
+    logger.info(f"🎉 {mode_title} 執行完畢！本次共產出/補齊 {total_added_blocks} 個段落。")
     logger.info(f"📊 經文總覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
     if final_gaps:
-        logger.warning(f"⚠️ 尚有 {len(final_gaps)} 處未完成區段，再次執行本指令即可接續推進。")
+        logger.warning(f"⚠️ 尚有 {len(final_gaps)} 處未完成區段：")
+        for idx, g in enumerate(final_gaps, 1):
+            logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(g['gap_text']))} 字 | 預覽: 『{g['gap_text'][:40]}...』")
     else:
-        logger.info("🎉 經文已 100% 銷文完畢！")
+        logger.info("🎉 經文已 100% 銷文完畢，全文完整無缺！")
     logger.info("=" * 65)
+
+
+def run_generate(
+    args: argparse.Namespace,
+    client: OpenAI,
+    model: str,
+    sutra_text: str,
+    output_path: str,
+    logger: logging.Logger
+) -> None:
+    """★ 全本全新銷文模式（調用統一推進引擎）"""
+    run_fill_gaps(
+        args=args, client=client, model=model, sutra_text=sutra_text,
+        output_path=output_path, logger=logger,
+        mode_title="全本銷文 (Generate)", issue_type="全本經文銷文"
+    )
 
 
 def run_fix_gaps(
@@ -1838,90 +1887,12 @@ def run_fix_gaps(
     output_path: str,
     logger: logging.Logger
 ) -> None:
-    """★ 專注補漏模式（掃描未銷文漏段 -> AI 自主分段 -> 實時安插與物理歸位）"""
-    logger.info("=" * 65)
-    logger.info(f"🛠️ 啟動專注補漏 (Fix Gaps) 模式：{output_path}")
-    logger.info("=" * 65)
-
-    if os.path.exists(output_path):
-        header, sections = parse_md_sections(output_path)
-        if sections:
-            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(sections)
-            reordered = reorder_markdown_by_sutra(cur_body, sutra_text)
-            safe_write_file(output_path, reordered)
-            segments = extract_segments_from_md(output_path)
-
-    missing_gaps = find_missing_gaps(sutra_text, segments)
-    if not missing_gaps:
-        logger.info("✅ 掃描完畢，經文覆蓋率已達 100%，未發現任何遺漏段落。")
-        return
-
-    logger.info(f"⚠️ 共檢測到 {len(missing_gaps)} 處遺漏段落，開始由 AI 自主分段補齊...")
-    total_added_blocks = 0
-
-    for gap_i, g in enumerate(missing_gaps, 1):
-        gap_raw = g["gap_text"]
-        prev_idx = g["prev_idx"]
-        prev_sentence = segments[prev_idx] if (segments and 0 <= prev_idx < len(segments)) else ""
-        remaining_gap = gap_raw.strip()
-
-        logger.info(f"\n[{gap_i}/{len(missing_gaps)}] 正在補漏（長度 {len(normalize_text(remaining_gap))} 字）：『{remaining_gap[:30]}...』")
-
-        def block_success_handler(block_content: str, sent: str):
-            nonlocal total_added_blocks, prev_sentence
-            total_added_blocks += 1
-            prev_sentence = sent
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                with open(output_path, "a", encoding="utf-8") as f:
-                    f.write("\n\n---\n\n" + block_content)
-            else:
-                base_name = os.path.splitext(os.path.basename(output_path))[0].replace("_銷文", "")
-                header_prefix = f"# 佛經銷文：{base_name}\n\n"
-                with open(output_path, "w", encoding="utf-8") as f:
-                    f.write(header_prefix + block_content)
-            header, cur_sections = parse_md_sections(output_path)
-            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(cur_sections)
-            reordered_md = reorder_markdown_by_sutra(cur_body, sutra_text)
-            safe_write_file(output_path, reordered_md)
-
-        blocks, rem_after = generate_sutra_segments(
-            client=client,
-            model=model,
-            sutra_text=sutra_text,
-            target_raw_text=remaining_gap,
-            prev_sentence=prev_sentence,
-            logger=logger,
-            issue_type="經文漏段補齊",
-            problem_desc="",
-            reasoning_effort=args.reasoning_effort,
-            on_block_success=block_success_handler
-        )
-
-        if not blocks or (rem_after and len(normalize_text(rem_after)) > 2):
-            logger.error(f"  ❌ 漏段於『{remaining_gap[:20]}...』處未完全銷文完成，終止補漏推進。")
-            break
-
-        # ⚡ 補完單個漏段後即時同步 segments，確保後續漏段前文脈絡精確對齊
-        segments = extract_segments_from_md(output_path)
-
-    # 計算最終覆蓋率
-    latest_segments = extract_segments_from_md(output_path)
-    final_gaps = find_missing_gaps(sutra_text, latest_segments)
-    clean_sutra_len = len(normalize_text(sutra_text))
-    total_gaps_chars = sum(len(normalize_text(g["gap_text"])) for g in final_gaps)
-    covered_chars = max(0, clean_sutra_len - total_gaps_chars)
-    coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
-
-    logger.info("\n" + "=" * 65)
-    logger.info(f"🎉 補漏模式執行完畢！本次共補齊安插 {total_added_blocks} 個子段落。")
-    logger.info(f"📊 最終經文覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
-    if final_gaps:
-        logger.warning(f"⚠️ 仍有 {len(final_gaps)} 處未銷文漏段：")
-        for idx, g in enumerate(final_gaps, 1):
-            logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(g['gap_text']))} 字 | 預覽: 『{g['gap_text'][:40]}...』")
-    else:
-        logger.info("🎉 經文已 100% 銷文完畢，無任何遺漏！")
-    logger.info("=" * 65)
+    """★ 專注補漏模式（調用統一推進引擎）"""
+    run_fill_gaps(
+        args=args, client=client, model=model, sutra_text=sutra_text,
+        output_path=output_path, logger=logger,
+        mode_title="專注補漏 (Fix Gaps)", issue_type="經文漏段補齊"
+    )
 
 
 def run_review(
@@ -2195,6 +2166,220 @@ def run_auto(
     logger.info("=" * 65)
 
 # ============================================================
+#  八-B、智慧狀態機與全自動流水線控制器 (Smart Pipeline)
+# ============================================================
+class PipelineState(Enum):
+    NEED_GENERATE = "全本銷文 (Generate)"
+    NEED_GAP_FILL_1 = "初次補漏 (Gap Fill 1)"
+    NEED_CHECKPOINT_FIX = "接續未完修復 (Resume Checkpoint)"
+    NEED_REVIEW_FIX = "依審查報告修復 (Execute Review Fix)"
+    NEED_AI_REVIEW = "AI 深度審查 (AI Review)"
+    COMPLETED = "全部流程已完工 (Completed)"
+
+
+def is_review_json_valid(review_path: str, md_path: str, segments: List[str]) -> bool:
+    """校驗既有 review.json 是否依然有效（防止手動編輯 MD 導致過期或索引漂移）"""
+    if not os.path.exists(review_path):
+        return False
+    # 若 MD 檔案修改時間晚於 review.json 超過 2 秒，視為報告已過期
+    if os.path.exists(md_path) and os.path.getmtime(md_path) > os.path.getmtime(review_path) + 2:
+        return False
+    try:
+        with open(review_path, "r", encoding="utf-8") as f:
+            issues = json.load(f)
+        if not issues:
+            return True
+        max_idx = max([max(iss.get("merge_indices", [iss.get("index", 0)])) for iss in issues])
+        return max_idx < len(segments)
+    except Exception:
+        return False
+
+
+def detect_current_state(
+    sutra_text: str,
+    output_path: str,
+    logger: logging.Logger
+) -> Tuple[PipelineState, Dict[str, Any]]:
+    """
+    【智慧狀態感知器】依據檔案現況自動判定流水線切入點：
+    1. 有 Checkpoint -> 優先接續修復
+    2. 無 MD 或 MD 為空 -> 啟動全本銷文
+    3. 有 MD 但覆蓋率 < 99.8% -> 進入初次補漏
+    4. 覆蓋率 100% 且有有效 review.json -> 進入 Fix 修復
+    5. 覆蓋率 100% 且無審查報告 -> 進入 AI Review
+    """
+    checkpoint_path = os.path.splitext(output_path)[0] + "_checkpoint.json"
+    review_path = os.path.splitext(output_path)[0] + "_review.json"
+
+    # 1. 優先檢查是否有修復到一半的 Checkpoint 暫存檔（且需確保 review.json 依然存在）
+    if os.path.exists(checkpoint_path) and os.path.exists(review_path):
+        cached = load_checkpoint(checkpoint_path)
+        if cached:
+            logger.info("🔍 [狀態感知] 發現中斷的修復暫存檔 (Checkpoint)，優先接續修復！")
+            return PipelineState.NEED_CHECKPOINT_FIX, {"checkpoint_path": checkpoint_path}
+
+    # 2. 檢查 MD 銷文檔是否存在
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        logger.info("🔍 [狀態感知] 未發現銷文 MD 檔案，將從頭啟動【全本銷文】。")
+        return PipelineState.NEED_GENERATE, {}
+
+    segments = extract_segments_from_md(output_path)
+    if not segments:
+        logger.info("🔍 [狀態感知] 銷文 MD 檔案無有效段落，將從頭啟動【全本銷文】。")
+        return PipelineState.NEED_GENERATE, {}
+
+    # 3. 計算覆蓋率與漏段
+    gaps = find_missing_gaps(sutra_text, segments)
+    clean_len = len(normalize_text(sutra_text))
+    gap_chars = sum(len(normalize_text(g["gap_text"])) for g in gaps)
+    coverage = ((clean_len - gap_chars) / max(1, clean_len)) * 100
+
+    # 若經文有遺漏 (覆蓋率 < 99.8%)，優先進行初次補漏
+    if gaps and coverage < 99.8:
+        logger.info(f"🔍 [狀態感知] 檢測到 MD 檔案已存在，但尚有 {len(gaps)} 處漏段（覆蓋率 {coverage:.1f}%），進入【初次補漏】。")
+        return PipelineState.NEED_GAP_FILL_1, {"gaps": gaps, "coverage": coverage}
+
+    # 4. 覆蓋率已達 100%，檢查是否有未執行的 review.json
+    if is_review_json_valid(review_path, output_path, segments):
+        with open(review_path, "r", encoding="utf-8") as f:
+            issues = json.load(f)
+        if issues:
+            logger.info(f"🔍 [狀態感知] 檢測到有效的審查報告 ({len(issues)} 處問題)，直接進入【修復階段】。")
+            return PipelineState.NEED_REVIEW_FIX, {"issues": issues}
+        else:
+            logger.info("🔍 [狀態感知] 既有審查報告顯示 0 問題且覆蓋率 100%，流程已圓滿完成！")
+            return PipelineState.COMPLETED, {}
+
+    # 5. 覆蓋率已達 100% 且無審查報告，進入 AI Review
+    logger.info(f"🔍 [狀態感知] 經文覆蓋率已達 100% ({len(segments)} 段)，進入【AI 深度審查】。")
+    return PipelineState.NEED_AI_REVIEW, {"segments": segments}
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    client: OpenAI,
+    model: str,
+    sutra_text: str,
+    style: str,
+    output_path: str,
+    logger: logging.Logger
+) -> None:
+    """
+    【四階段閉環智慧流水線】
+    銷文 (Generate) -> 初次補漏 (Gap Fill 1) -> AI 審查與修復 (Review & Fix) -> 二次補漏 (Gap Fill 2)
+    """
+    logger.info("=" * 68)
+    logger.info(f"🌟 啟動佛經銷文智慧閉環流水線")
+    logger.info(f"   經文檔案：{args.file}")
+    logger.info(f"   輸出檔案：{output_path}")
+    logger.info("=" * 68)
+
+    last_state = None
+    last_covered_chars = -1
+    stall_count = 0
+
+    while True:
+        state, meta = detect_current_state(sutra_text, output_path, logger)
+
+        # 取得當前已覆蓋漢字數，用於防死鎖監控
+        cur_segs = extract_segments_from_md(output_path) if os.path.exists(output_path) else []
+        cur_gaps = find_missing_gaps(sutra_text, cur_segs)
+        cur_covered = len(normalize_text(sutra_text)) - sum(len(normalize_text(g["gap_text"])) for g in cur_gaps)
+
+        if state == last_state and cur_covered == last_covered_chars and state != PipelineState.COMPLETED:
+            stall_count += 1
+            if stall_count >= 2:
+                logger.error(f"\n❌ [防死鎖警報] 流水線在【{state.value}】階段未產生實質進展，安全中止以防耗費額度。")
+                logger.warning(f"👉 請檢查日誌確認 API 是否正常，或手動檢視：{output_path}")
+                break
+        else:
+            stall_count = 0
+
+        last_state = state
+        last_covered_chars = cur_covered
+
+        if state == PipelineState.COMPLETED:
+            # 流程圓滿完工，清理暫存的 review.json 與 checkpoint
+            review_path = os.path.splitext(output_path)[0] + "_review.json"
+            if os.path.exists(review_path):
+                try:
+                    os.remove(review_path)
+                except Exception:
+                    pass
+            logger.info("\n" + "=" * 68)
+            logger.info("🎉🎉🎉 全流程圓滿完成！經文 100% 全文覆蓋，且已通過因明文法深度審查！")
+            logger.info(f"最終成果：{output_path}")
+            logger.info("=" * 68)
+            break
+
+        # -------------------------------------------------------------
+        # 階段一：全本銷文 (Generate)
+        # -------------------------------------------------------------
+        elif state == PipelineState.NEED_GENERATE:
+            logger.info("\n🚀 === [Stage 1/4] 開始全本銷文 ===")
+            run_generate(args, client, model, sutra_text, output_path, logger)
+
+        # -------------------------------------------------------------
+        # 階段二：初次補漏 (Gap Fill 1)
+        # -------------------------------------------------------------
+        elif state == PipelineState.NEED_GAP_FILL_1:
+            logger.info("\n🛠️ === [Stage 2/4] 執行初次補漏（確保 Review 前全文到位）===")
+            segments = extract_segments_from_md(output_path)
+            run_fix_gaps(args, client, model, sutra_text, segments, style, output_path, logger)
+
+        # -------------------------------------------------------------
+        # 階段三 a：AI 深度審查 (Review)
+        # -------------------------------------------------------------
+        elif state == PipelineState.NEED_AI_REVIEW:
+            logger.info("\n🧐 === [Stage 3a/4] 執行 AI 深度邏輯與科判審查 ===")
+            segments = extract_segments_from_md(output_path)
+            issues = run_review(args, client, model, sutra_text, segments, style, output_path, logger)
+            if issues is None:
+                logger.error("❌ 審查過程遭遇錯誤，流水線已安全暫停。")
+                break
+            if not issues:
+                logger.info("✨ 經審查無任何語意割裂，品質極佳！")
+                review_path = os.path.splitext(output_path)[0] + "_review.json"
+                with open(review_path, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+                continue
+
+        # -------------------------------------------------------------
+        # 階段三 b：執行修復 (Fix / Resume Checkpoint)
+        # -------------------------------------------------------------
+        elif state in (PipelineState.NEED_REVIEW_FIX, PipelineState.NEED_CHECKPOINT_FIX):
+            logger.info("\n🔧 === [Stage 3b/4] 執行段落合併與瑕疵重寫 ===")
+            segments = extract_segments_from_md(output_path)
+            # 在流水線模式下，確保本輪檢出問題全數修復（不受預設 50 條限制）
+            issues_to_fix = meta.get("issues")
+            if issues_to_fix and args.max_fix == 50:
+                args.max_fix = len(issues_to_fix)
+            success = run_fix(args, client, model, sutra_text, segments, output_path, logger, all_issues=issues_to_fix)
+            if not success:
+                logger.warning("⚠️ 修復中斷，已保存現有進度。隨時再次執行原指令即可秒級接續。")
+                break
+
+            # -------------------------------------------------------------
+            # 階段四：二次安全補漏 (Gap Fill 2 - 消除微型縫隙)
+            # -------------------------------------------------------------
+            logger.info("\n🔍 === [Stage 4/4] 執行二次安全補漏（防止重切產生的微型縫隙）===")
+            latest_segs = extract_segments_from_md(output_path)
+            final_gaps = find_missing_gaps(sutra_text, latest_segs)
+            if final_gaps:
+                logger.info(f"檢測到修復後產生 {len(final_gaps)} 處微小縫隙，立即自動補齊...")
+                run_fix_gaps(args, client, model, sutra_text, latest_segs, style, output_path, logger)
+            else:
+                logger.info("✅ 完美！修復後經文依然 100% 完整無任何縫隙。")
+
+            # ★ 寫入空陣列標記本輪已修復完畢，讓下一輪狀態機精確判定 COMPLETED，防止重複觸發 Review
+            review_path = os.path.splitext(output_path)[0] + "_review.json"
+            try:
+                with open(review_path, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+            except Exception:
+                pass
+
+# ============================================================
 #  九、金鑰讀取與輔助入口
 # ============================================================
 def load_api_key(key_file: Optional[str] = None, api_key_str: Optional[str] = None, is_opencode: bool = False) -> Optional[str]:
@@ -2219,7 +2404,12 @@ def load_api_key(key_file: Optional[str] = None, api_key_str: Optional[str] = No
             os.path.join(base_dir, "api_key.txt"),
         ])
     else:
-        candidate_files.append(os.path.join(base_dir, "api_key.txt"))
+        candidate_files.extend([
+            os.path.join(base_dir, "api_key.txt"),
+            os.path.join(base_dir, "deepseek_key.txt"),
+            os.path.join(base_dir, "deepseek_api_key.txt"),
+            os.path.join(base_dir, "key.txt"),
+        ])
 
     for kf in candidate_files:
         if os.path.exists(kf):
@@ -2243,32 +2433,36 @@ def auto_output_path(input_file: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（模組化重構版）")
+    parser = argparse.ArgumentParser(description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（智慧閉環流水線版）")
     parser.add_argument("--file", type=str, required=True, help="原始經文 txt 檔案路徑")
     parser.add_argument("--output", type=str, default=None, help="目標銷文 md 檔案路徑（預設自動推導）")
-    parser.add_argument("--generate", "--gen", action="store_true", help="★ 全本從頭銷文模式（將全篇經文視為大漏段，AI自主逐段推進產出）")
-    parser.add_argument("--auto", action="store_true", help="★ 一鍵全流程（審查 + 修正 + 重排）")
-    parser.add_argument("--fix-gaps", "--gaps", action="store_true", help="★ 專注補漏模式（快速掃描漏段，AI自主分段補齊並物理歸位）")
-    parser.add_argument("--review", action="store_true", help="僅執行審查並輸出 review.json")
-    parser.add_argument("--fix", action="store_true", help="讀取 review.json 執行修正")
+    
+    # 執行模式（預設直接執行 run_pipeline 智慧全流程，亦保留手動指定特定階段之旗標）
+    parser.add_argument("--auto", action="store_true", help="★ 智慧全流程模式（預設啟動：銷文->補漏->審查修復->二次補漏）")
+    parser.add_argument("--generate", "--gen", action="store_true", help="手動指定：強制全本從頭銷文")
+    parser.add_argument("--fix-gaps", "--gaps", action="store_true", help="手動指定：僅執行補漏")
+    parser.add_argument("--review", action="store_true", help="手動指定：僅執行 AI 審查並輸出 review.json")
+    parser.add_argument("--fix", action="store_true", help="手動指定：僅讀取 review.json 執行修正")
     parser.add_argument("--dry-run", action="store_true", help="預覽待修清單，不呼叫 API 且不更動檔案")
+    
+    # API 與模型參數
     parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="呼叫模型名稱")
     parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
     parser.add_argument("--opencode", "--go", action="store_true", dest="opencode", help="★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)")
     parser.add_argument("--zen", action="store_true", help="使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)")
-    parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL（OpenCode Go 預設為 https://opencode.ai/zen/go/v1）")
+    parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL")
     parser.add_argument("--api-key", type=str, default=None, help="直接指定 API Key 字串")
     parser.add_argument("--api-key-file", type=str, default=None, help="指定 API Key 檔案路徑")
     args = parser.parse_args()
 
-    if not args.auto and not args.review and not args.fix and not args.fix_gaps and not args.dry_run and not args.generate:
-        print("請指定運作模式：--generate（全本銷文）、--auto（一鍵全流程）、--fix-gaps（專注補漏）、--review（僅審查）、--fix（依報告修正）或 --dry-run（預覽待修清單）")
-        return
+    # 若未指定任何手動子模式旗標，預設啟動 --auto 智慧閉環全流程
+    has_manual_mode = (args.generate or args.fix_gaps or args.review or args.fix or args.dry_run)
+    if not has_manual_mode:
+        args.auto = True
 
-    # 若單獨使用 --dry-run，自動視為 --fix --dry-run
-    if args.dry_run and not args.auto and not args.review and not args.fix_gaps and not args.generate:
+    if args.dry_run and not args.fix:
         args.fix = True
 
     if args.output is None:
@@ -2286,7 +2480,9 @@ def main():
 
     style = detect_punctuation_style(sutra_text)
     segments = extract_segments_from_md(args.output)
-    if not segments and not args.fix_gaps and not args.generate:
+
+    # 僅在純手動修復/審查模式下，若無任何段落才報錯；智慧模式下若無段落會自動觸發全本銷文
+    if not segments and (args.review or (args.fix and not args.auto)):
         logger.error(f"無法從銷文檔 {args.output} 提取到任何「🔹 原典」段落，請確認檔案路徑。")
         return
 
@@ -2311,13 +2507,13 @@ def main():
     logger.info(f"API 提供商: {provider_name} ({base_url}) | 模型: {args.model}")
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.timeout)
 
-    # 根據不同模式呼叫專屬控制器
-    if args.generate:
+    # 路由調度：預設走智慧閉環全流程，亦保留手動個別階段的呼叫能力
+    if args.auto and not (args.generate or args.fix_gaps or args.review or (args.fix and not args.dry_run)):
+        run_pipeline(args, client, args.model, sutra_text, style, args.output, logger)
+    elif args.generate:
         run_generate(args, client, args.model, sutra_text, args.output, logger)
     elif args.fix_gaps:
         run_fix_gaps(args, client, args.model, sutra_text, segments, style, args.output, logger)
-    elif args.auto:
-        run_auto(args, client, args.model, sutra_text, segments, style, args.output, logger)
     elif args.review:
         run_review(args, client, args.model, sutra_text, segments, style, args.output, logger)
     elif args.fix or args.dry_run:
