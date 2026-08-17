@@ -423,6 +423,26 @@ def request_and_validate_segment(
     回傳: (success_block, extracted_sent, should_terminate)
     """
     retry_feedback = ""
+    norm_rem_len = len(normalize_text(remaining_text))
+
+    # 動態長文切分指引：若剩餘經文較長且包含多個句讀，提醒 AI 僅切出首個子單元
+    split_hint = ""
+    if norm_rem_len > 50:
+        split_hint = (
+            f"⚠️【切分提醒】：當前剩餘待處理經文較長（共 {norm_rem_len} 字，含多個獨立句意/法相）。"
+            f"請【務必僅截取開頭第一個主題自足的法義子單元】（約 20～50 字）進行銷文，"
+            f"切勿一次全數吞併！未處理的後續經文系統會在下一輪自動交由你繼續推進。\n\n"
+        )
+
+    guideline_section = ""
+    if guideline_title or first_rule or dup_guide:
+        g_parts = [guideline_title] if guideline_title else []
+        if first_rule:
+            g_parts.append(first_rule)
+        if dup_guide:
+            g_parts.append(dup_guide)
+        guideline_section = "\n".join(g_parts) + "\n\n"
+
     for retry in range(3):
         problem_section = f"【本處病灶與修正建議】：\n{problem_desc}\n\n" if (problem_desc and not is_gap_mode) else ""
         feedback_section = f"\n【🚨 上一輪輸出未通過校驗，請依此指示修正】：\n{retry_feedback}\n" if retry_feedback else ""
@@ -430,7 +450,9 @@ def request_and_validate_segment(
         user_msg = (
             f"【經典全本文脈背景】：\n{sutra_text}\n\n"
             f"【前文脈絡錨點】：\n{prev_sentence if prev_sentence else '（經文起始段落）'}\n\n"
+            f"{guideline_section}"
             f"{problem_section}"
+            f"{split_hint}"
             f"【🚨 當前待銷文剩餘經文（請嚴格從第一個字開始）】：\n{remaining_text}"
             f"{feedback_section}"
         )
@@ -1132,8 +1154,8 @@ FIX_SYSTEM = """【角色設定】
 1. 【起點嚴格、字字精確】：輸出的「🔹 原典」必須嚴格從指定的剩餘經文第一個字開始，一字不差，絕對禁止省略號（...、（中略））。
 2. 【適切粒度與自然切分】：
    - ★【語意自足與拒絕過度碎化】：切分出的單元應具備完整的講述主題。精練問答（如「王言：不也。」）、法相標題、獨立設問句雖短亦可獨立成段；但【嚴禁將密集排比名相、連續句列（如「X句非X句」、「見X、見Y」）逐逗號生硬拆成數個字的碎片】。
-   - ★【密集排比與名相列舉之分組原則】：遇到密集連續的名相列舉或對稱句群時，請依義理類別自然組合為適中單元（約 20～70 字，或 3～6 組排比）進行統攝銷釋，避免支離破碎與過度重複。
-   - ★【長文自然推進】：若待銷文經文較長，請切分出【當前第一個主題自足的完整段落/偈頌/排比群組】（約 30～90 字）進行銷文，未處理的後續經文系統會在下一輪自動推進。
+   - ★【密集排比與名相列舉之分組原則】：遇到密集連續的名相列舉或對稱句群時，請依義理類別自然組合為適中單元（約 20～50 字，或 3～5 組排比）進行統攝銷釋，避免支離破碎與過度重複。
+   - ★【最適講經單元與長文推進】：單次銷文的最適原典篇幅約為【20～50 字】（或一完整句義、一整偈、一組法相轉折）。若待銷文經文較長（含多個獨立句讀或不同層次法相），【嚴禁一次全數吞併銷文】！請務必僅截取【開頭第一個主題自足的完整子單元】（約 20～50 字）進行銷文，後續經文系統會在下一輪自動推進。
 
 【銷文與解義原則】
 1. 極盡詳盡的銷解：依傳統講經「消文釋義」的方式，鋸細靡遺地拆解該句經文的文言句法與字面意義，落實每一個字、詞的作用，不可含糊帶過。
@@ -1162,7 +1184,9 @@ def stream_completion(
     action_name: str = "LLM 呼叫"
 ) -> str:
     """封裝串流 LLM 呼叫，具備 Token 上限校準、思考心跳與自動降級機制"""
-    max_tokens_val = 384000
+    # OpenRouter / GLM 等免費模型單次上限通常為 4096~65536，DeepSeek 則可設較大
+    is_openrouter_or_glm = ":free" in model or "glm" in model.lower() or "openrouter" in str(client.base_url)
+    max_tokens_val = 65536 if is_openrouter_or_glm else 384000
 
     create_kwargs = {
         "model": model,
@@ -1174,7 +1198,7 @@ def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if reasoning_effort:
+    if reasoning_effort and not is_openrouter_or_glm:
         create_kwargs["extra_body"] = {
             "thinking": {"type": "enabled"},
             "reasoning_effort": reasoning_effort,
@@ -1184,24 +1208,25 @@ def stream_completion(
         resp = client.chat.completions.create(**create_kwargs)
     except Exception as api_err:
         err_str = str(api_err).lower()
+        # 0. 針對 OpenRouter/GLM 之 max_tokens 過大報錯降級
+        if "max_tokens" in err_str or "maximum allowed" in err_str:
+            create_kwargs["max_tokens"] = 4096
         # 1. 降級去除 extra_body (thinking 參數)
         if "extra_body" in create_kwargs and ("extra_body" in err_str or "unrecognized" in err_str or "thinking" in err_str):
             create_kwargs.pop("extra_body", None)
-            try:
-                resp = client.chat.completions.create(**create_kwargs)
-            except Exception as e2:
-                # 2. 降級去除 stream_options (部分反向代理不支援)
-                if "stream_options" in str(e2).lower():
-                    create_kwargs.pop("stream_options", None)
-                    resp = client.chat.completions.create(**create_kwargs)
-                else:
-                    raise e2
-        # 2. 直接降級去除 stream_options
-        elif "stream_options" in err_str:
+        # 2. 降級去除 stream_options (部分反向代理不支援)
+        if "stream_options" in err_str or "stream_options" in str(api_err):
             create_kwargs.pop("stream_options", None)
+
+        try:
             resp = client.chat.completions.create(**create_kwargs)
-        else:
-            raise api_err
+        except Exception as e2:
+            # 二次安全降級：同時去除 stream_options 與 extra_body
+            create_kwargs.pop("extra_body", None)
+            create_kwargs.pop("stream_options", None)
+            if "max_tokens" in str(e2).lower():
+                create_kwargs["max_tokens"] = 4096
+            resp = client.chat.completions.create(**create_kwargs)
 
     content_parts = []
     last_chunk = None
@@ -1350,16 +1375,16 @@ def generate_sutra_segments(
     dup_guide = ""
     if "重複" in issue_type:
         dup_guide = (
-            "\n4. 【重複內容特別指引】：若前文已包含部分重複經文，請僅針對指定的剩餘經文進行銷文；"
-            "若本段經文已完全重複，請直接輸出 <!-- DELETE -->。\n"
+            "4. 【重複內容特別指引】：若前文已包含部分重複經文，請僅針對指定的剩餘經文進行銷文；"
+            "若本段經文已完全重複，請直接輸出 <!-- DELETE -->。"
         )
 
     is_gap_mode = ("經文漏段補齊" in issue_type or "補漏" in issue_type or "全本經文銷文" in issue_type)
     guideline_title = "【補漏指引與核心規範】" if is_gap_mode else "【修復通用指引與核心規範】"
     first_rule = (
-        "1. 這是一段先前遺漏的經文，請切分出當前第一個語意自足的獨立單元進行銷文，並符合所有銷文結構規範。"
+        "1. 這是一段先前遺漏或待推進的經文，若經文較長，請僅切分出當前第一個語意自足的獨立單元（約 20～50 字）進行銷文，切勿一次全吞。"
         if is_gap_mode
-        else "1. 請切出當前第一個語意自足的獨立單元進行銷文，並符合所有銷文結構規範。"
+        else "1. 請切出當前第一個語意自足的獨立單元（約 20～50 字）進行銷文，並符合所有銷文結構規範。"
     )
 
     while remaining_text and len(normalize_text(remaining_text)) > 0 and loop_guard < max_loops:
@@ -1846,9 +1871,9 @@ REVIEW_SYSTEM = """你是精通三藏文法、因明論理、佛經科判與講�
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✂️ 二、何時【必須標記拆分】？（修復超長堆疊 -> merge_indices 僅填 [單一段落編號]）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-凡單一段落過長（散文 > 120~140 字），且內部包含多個明顯可獨立開示的完整句子時標記拆分：
+凡單一段落過長（散文 > 80~100 字，且內部包含多個可獨立開示的完整法義句）時標記拆分：
 1. 【問答角色混雜】：前半段為請法者之問，後半段直接轉為佛陀之答，應在轉折處標記拆分。
-2. 【多重法相過度堆疊】：一段內塞入過多不相干的長篇平行法相導致銷文臃腫，應拆為適度單元（每個單元仍應維持 20~80 字的完整義理脈絡，切勿過度切碎）。
+2. 【多重法相過度堆疊】：一段內塞入過多不相干的長篇平行法相導致銷文臃腫，應拆為適度單元（每個單元仍應維持 20~50 字的完整義理脈絡，切勿過度切碎）。
 3. 【偈頌連續堆疊過長】：偈頌連續超過 2 整偈（五言 >40 字、七言 >56 字），應拆分為 1~2 偈。
 ★【拆分標記規範】：`type` 填 `單段過長需拆分`，`merge_indices` 【必須嚴格只填單一索引 [段號]】（如 `[49]`）。
 
@@ -2550,10 +2575,10 @@ def run_auto(
 # ============================================================
 class PipelineState(Enum):
     NEED_GENERATE = "全本銷文 (Generate)"
-    NEED_GAP_FILL_1 = "初次補漏 (Gap Fill 1)"
+    NEED_AI_REVIEW = "AI 深度審查 (AI Review)"
     NEED_CHECKPOINT_FIX = "接續未完修復 (Resume Checkpoint)"
     NEED_REVIEW_FIX = "依審查報告修復 (Execute Review Fix)"
-    NEED_AI_REVIEW = "AI 深度審查 (AI Review)"
+    NEED_GAP_FILL = "終局安全補漏 (Safety Gap Fill)"
     COMPLETED = "全部流程已完工 (Completed)"
 
 
@@ -2583,9 +2608,9 @@ def detect_current_state(
     【智慧狀態感知器】依據檔案現況自動判定流水線切入點：
     1. 有 Checkpoint -> 優先接續修復
     2. 無 MD 或 MD 為空 -> 啟動全本銷文
-    3. 有 MD 但有實質漏字 -> 進入初次補漏
-    4. 覆蓋率 100% 且有有效 review.json -> 進入 Fix 修復
-    5. 覆蓋率 100% 且無審查報告 -> 進入 AI Review
+    3. 有有效 review.json 且有問題待修 -> 進入 Fix 修復
+    4. 有有效 review.json 且無問題 -> 檢查覆蓋率（100% 完工，否則終局補漏）
+    5. 無審查報告 -> ★ 直接進入 AI 深度審查（含預檢與漏段掃描）
     """
     checkpoint_path = os.path.splitext(output_path)[0] + "_checkpoint.json"
     review_path = os.path.splitext(output_path)[0] + "_review.json"
@@ -2613,21 +2638,7 @@ def detect_current_state(
         logger.info("🔍 [狀態感知] 銷文 MD 檔案無有效段落，將從頭啟動【全本銷文】。")
         return PipelineState.NEED_GENERATE, {}
 
-    # 3. 計算覆蓋率與漏段
-    gaps = find_missing_gaps(sutra_text, segments)
-    clean_len = len(normalize_text(sutra_text))
-    gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in gaps)
-    coverage = ((clean_len - gap_chars) / max(1, clean_len)) * 100
-
-    # ★ 修正：只要有任何實質漏字就進入補漏，不再依賴 99.8% 百分比門檻
-    if gaps and gap_chars > 0:
-        logger.info(
-            f"🔍 [狀態感知] 檢測到 MD 檔案已存在，但尚有 {len(gaps)} 處漏段"
-            f"（實質漏字 {gap_chars} 字，覆蓋率 {coverage:.1f}%），進入【初次補漏】。"
-        )
-        return PipelineState.NEED_GAP_FILL_1, {"gaps": gaps, "coverage": coverage}
-
-    # 4. 覆蓋率已達 100%，檢查是否有未執行的 review.json
+    # 3. 檢查是否有未執行的有效 review.json
     if is_review_json_valid(review_path, output_path, segments):
         with open(review_path, "r", encoding="utf-8") as f:
             issues = json.load(f)
@@ -2635,11 +2646,18 @@ def detect_current_state(
             logger.info(f"🔍 [狀態感知] 檢測到有效的審查報告 ({len(issues)} 處問題)，直接進入【修復階段】。")
             return PipelineState.NEED_REVIEW_FIX, {"issues": issues}
         else:
-            logger.info("🔍 [狀態感知] 既有審查報告顯示 0 問題且覆蓋率 100%，流程已圓滿完成！")
-            return PipelineState.COMPLETED, {}
+            # 審查報告 0 問題，核驗最終覆蓋率
+            gaps = find_missing_gaps(sutra_text, segments)
+            gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in gaps)
+            if gaps and gap_chars > 0:
+                logger.info(f"🔍 [狀態感知] 審查通過但仍殘留 {len(gaps)} 處縫隙 ({gap_chars} 字)，進入【終局安全補漏】。")
+                return PipelineState.NEED_GAP_FILL, {"gaps": gaps}
+            else:
+                logger.info("🔍 [狀態感知] 審查報告 0 問題且經文覆蓋率 100%，流程已圓滿完成！")
+                return PipelineState.COMPLETED, {}
 
-    # 5. 覆蓋率已達 100% 且無審查報告，進入 AI Review
-    logger.info(f"🔍 [狀態感知] 經文覆蓋率已達 100% ({len(segments)} 段)，進入【AI 深度審查】。")
+    # 4. 無審查報告 -> ★ 直接進入 AI Review（先審查再修復）
+    logger.info(f"🔍 [狀態感知] 銷文檔案已就緒 ({len(segments)} 個段落)，直接啟動【AI 深度審查與全域預檢】。")
     return PipelineState.NEED_AI_REVIEW, {"segments": segments}
 
 
@@ -2653,11 +2671,11 @@ def run_pipeline(
     logger: logging.Logger
 ) -> None:
     """
-    【四階段閉環智慧流水線】
-    銷文 (Generate) -> 初次補漏 (Gap Fill 1) -> AI 審查與修復 (Review & Fix) -> 二次補漏 (Gap Fill 2)
+    【閉環智慧流水線（先審查後修補）】
+    全本銷文 (Generate) -> AI 深度審查與全域預檢 (AI Review) -> 依報告修復與補漏 (Review & Gap Fix) -> 終局安全補漏 (Safety Gap Fill)
     """
     logger.info("=" * 68)
-    logger.info("🌟 啟動佛經銷文智慧閉環流水線")
+    logger.info("🌟 啟動佛經銷文智慧閉環流水線（先審查後修復版）")
     logger.info(f"   經文檔案：{args.file}")
     logger.info(f"   輸出檔案：{output_path}")
     logger.info("=" * 68)
@@ -2701,30 +2719,25 @@ def run_pipeline(
             break
 
         elif state == PipelineState.NEED_GENERATE:
-            logger.info("\n🚀 === [Stage 1/4] 開始全本銷文 ===")
+            logger.info("\n🚀 === [Stage 1/3] 開始全本初次銷文 ===")
             run_generate(args, client, model, sutra_text, output_path, logger)
 
-        elif state == PipelineState.NEED_GAP_FILL_1:
-            logger.info("\n🛠️ === [Stage 2/4] 執行初次補漏（確保 Review 前全文到位）===")
-            segments = extract_segments_from_md(output_path)
-            run_fix_gaps(args, client, model, sutra_text, segments, style, output_path, logger)
-
         elif state == PipelineState.NEED_AI_REVIEW:
-            logger.info("\n🧐 === [Stage 3a/4] 執行 AI 深度邏輯與科判審查 ===")
+            logger.info("\n🧐 === [Stage 2/3] 直接執行 AI 深度邏輯審查與全域漏段預檢 ===")
             segments = extract_segments_from_md(output_path)
             issues = run_review(args, client, model, sutra_text, segments, style, output_path, logger)
             if issues is None:
                 logger.error("❌ 審查過程遭遇錯誤，流水線已安全暫停。")
                 break
             if not issues:
-                logger.info("✨ 經審查無任何語意割裂，品質極佳！")
+                logger.info("✨ 經審查無任何語意割裂且無漏段，品質極佳！")
                 review_path = os.path.splitext(output_path)[0] + "_review.json"
                 with open(review_path, "w", encoding="utf-8") as f:
                     json.dump([], f)
                 continue
 
         elif state in (PipelineState.NEED_REVIEW_FIX, PipelineState.NEED_CHECKPOINT_FIX):
-            logger.info("\n🔧 === [Stage 3b/4] 執行段落合併與瑕疵重寫 ===")
+            logger.info("\n🔧 === [Stage 3/3] 依審查報告執行段落合併、瑕疵重寫與漏段補齊 ===")
             segments = extract_segments_from_md(output_path)
             issues_to_fix = meta.get("issues")
             if issues_to_fix and args.max_fix == 50:
@@ -2734,15 +2747,6 @@ def run_pipeline(
                 logger.warning("⚠️ 修復中斷，已保存現有進度。隨時再次執行原指令即可秒級接續。")
                 break
 
-            logger.info("\n🔍 === [Stage 4/4] 執行二次安全補漏（防止重切產生的微型縫隙）===")
-            latest_segs = extract_segments_from_md(output_path)
-            final_gaps = find_missing_gaps(sutra_text, latest_segs)
-            if final_gaps:
-                logger.info(f"檢測到修復後產生 {len(final_gaps)} 處微小縫隙，立即自動補齊...")
-                run_fix_gaps(args, client, model, sutra_text, latest_segs, style, output_path, logger)
-            else:
-                logger.info("✅ 完美！修復後經文依然 100% 完整無任何縫隙。")
-
             review_path = os.path.splitext(output_path)[0] + "_review.json"
             try:
                 with open(review_path, "w", encoding="utf-8") as f:
@@ -2750,16 +2754,32 @@ def run_pipeline(
             except Exception:
                 pass
 
+        elif state == PipelineState.NEED_GAP_FILL:
+            logger.info("\n🔍 === [終局安全核驗] 執行微小縫隙安全補漏 ===")
+            latest_segs = extract_segments_from_md(output_path)
+            run_fix_gaps(args, client, model, sutra_text, latest_segs, style, output_path, logger)
+
 
 # ============================================================
 #  十一、金鑰讀取與輔助入口
 # ============================================================
-def load_api_key(key_file: Optional[str] = None, api_key_str: Optional[str] = None, is_opencode: bool = False) -> Optional[str]:
+def load_api_key(
+    key_file: Optional[str] = None,
+    api_key_str: Optional[str] = None,
+    is_opencode: bool = False,
+    is_free_glm: bool = False
+) -> Optional[str]:
     """讀取 API Key：命令列參數 > 環境變數 > 檔案"""
     if api_key_str and api_key_str.strip():
         return api_key_str.strip()
 
-    env_vars = ["OPENCODE_API_KEY", "OPENAI_API_KEY"] if is_opencode else ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+    if is_free_glm:
+        env_vars = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
+    elif is_opencode:
+        env_vars = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
+    else:
+        env_vars = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+
     for var in env_vars:
         val = os.environ.get(var)
         if val and val.strip():
@@ -2769,7 +2789,15 @@ def load_api_key(key_file: Optional[str] = None, api_key_str: Optional[str] = No
     candidate_files = []
     if key_file:
         candidate_files.append(key_file)
-    if is_opencode:
+
+    if is_free_glm:
+        candidate_files.extend([
+            os.path.join(base_dir, "openrouter_key.txt"),
+            os.path.join(base_dir, "openrouter_api_key.txt"),
+            os.path.join(base_dir, "glm_key.txt"),
+            os.path.join(base_dir, "api_key.txt"),
+        ])
+    elif is_opencode:
         candidate_files.extend([
             os.path.join(base_dir, "opencode_key.txt"),
             os.path.join(base_dir, "opencode_api_key.txt"),
@@ -2790,8 +2818,16 @@ def load_api_key(key_file: Optional[str] = None, api_key_str: Optional[str] = No
             if key:
                 return key
 
-    target_name = "opencode_key.txt (或 api_key.txt)" if is_opencode else "api_key.txt"
-    env_hint = "OPENCODE_API_KEY / OPENAI_API_KEY" if is_opencode else "DEEPSEEK_API_KEY / OPENAI_API_KEY"
+    if is_free_glm:
+        target_name = "openrouter_key.txt (或 glm_key.txt / api_key.txt)"
+        env_hint = "OPENROUTER_API_KEY / OPENAI_API_KEY"
+    elif is_opencode:
+        target_name = "opencode_key.txt (或 api_key.txt)"
+        env_hint = "OPENCODE_API_KEY / OPENAI_API_KEY"
+    else:
+        target_name = "api_key.txt"
+        env_hint = "DEEPSEEK_API_KEY / OPENAI_API_KEY"
+
     print(f"❌ 找不到金鑰檔案或內容為空，請建立 {target_name} 或設定環境變數 ({env_hint})")
     return None
 
@@ -2824,6 +2860,7 @@ def main():
     parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
+    parser.add_argument("--free-glm", "--glm5", "--glm", action="store_true", dest="free_glm", help="★ 使用 OpenRouter Free GLM 5.2 免費模型端點 (https://openrouter.ai/api/v1)")
     parser.add_argument("--opencode", "--go", action="store_true", dest="opencode", help="★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)")
     parser.add_argument("--zen", action="store_true", help="使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)")
     parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL")
@@ -2861,7 +2898,14 @@ def main():
     logger.info(f"銷文檔案: {os.path.abspath(args.output)} ({len(segments)} 個段落)")
 
     is_opencode_provider = args.opencode or args.zen
-    if args.zen:
+    is_free_glm_provider = args.free_glm
+
+    if args.free_glm:
+        base_url = args.base_url or "https://openrouter.ai/api/v1"
+        provider_name = "OpenRouter Free GLM 5.2 (https://openrouter.ai/api/v1)"
+        if args.model == "deepseek-v4-flash":
+            args.model = "z-ai/glm-5.2:free"
+    elif args.zen:
         base_url = args.base_url or "https://opencode.ai/zen/v1"
         provider_name = "OpenCode Zen 按量計費 (https://opencode.ai/zen/v1)"
     elif args.opencode:
@@ -2871,7 +2915,12 @@ def main():
         base_url = args.base_url or "https://api.deepseek.com"
         provider_name = "DeepSeek 官方 API"
 
-    api_key = load_api_key(key_file=args.api_key_file, api_key_str=args.api_key, is_opencode=is_opencode_provider)
+    api_key = load_api_key(
+        key_file=args.api_key_file,
+        api_key_str=args.api_key,
+        is_opencode=is_opencode_provider,
+        is_free_glm=is_free_glm_provider
+    )
     if not api_key:
         return
 

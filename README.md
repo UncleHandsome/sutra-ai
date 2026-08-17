@@ -33,10 +33,13 @@ pip install openai
 ### 2. 配置 API 金鑰
 支援三種配置方式（優先順序：**命令列參數 > 環境變數 > 金鑰檔案**）：
 
+#### 【修改後】
+```markdown
 * **方式 A：檔案放置（推薦，最方便）**
   在 `sutra.py` 同層目錄下建立檔案：
   - 使用 DeepSeek 官方 API：建立 `api_key.txt` 或 `deepseek_key.txt`，貼入金鑰（如 `sk-...`）。
   - 使用 OpenCode 平台：建立 `opencode_key.txt`，貼入金鑰。
+  - 使用 OpenRouter / GLM 免費端點：建立 `openrouter_key.txt` 或 `glm_key.txt`，貼入金鑰。
 
 * **方式 B：設定環境變數**
   ```bash
@@ -44,9 +47,13 @@ pip install openai
   export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
   # 或 OpenCode
   export OPENCODE_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+  # 或 OpenRouter / GLM
+  export OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxx"
 
   # Windows PowerShell
   $env:DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+  # 或 OpenRouter / GLM
+  $env:OPENROUTER_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxx"
   ```
 
 * **方式 C：命令列直接傳入**
@@ -66,6 +73,7 @@ pip install openai
 | **僅執行 AI 深度審查** | `python sutra.py --file 1.txt --review` | 不修改檔案，僅產出審查報告 `1_銷文_review.json` |
 | **預覽修正清單 (Dry Run)** | `python sutra.py --file 1.txt --fix --dry-run` | 讀取 review.json 預覽待修項目，**不呼叫 API 且不更動檔案** |
 | **依報告執行修正** | `python sutra.py --file 1.txt --fix` | 讀取 review.json 針對標記問題段落進行重新銷文與合併 |
+| **使用 OpenRouter Free GLM 5.2** | `python sutra.py --file 1.txt --auto --free-glm` | ★ 使用免費 GLM 5.2 模型端點 (`https://openrouter.ai/api/v1`) |
 | **切換 OpenCode Go 訂閱端點** | `python sutra.py --file 1.txt --auto --opencode` | 使用 `https://opencode.ai/zen/go/v1` 端點 |
 | **切換 OpenCode Zen 計量端點** | `python sutra.py --file 1.txt --auto --zen` | 使用 `https://opencode.ai/zen/v1` 端點 |
 
@@ -77,16 +85,17 @@ pip install openai
 系統內建智慧狀態機（State Machine），會根據輸入與現有檔案狀態自動切換：
 ```mermaid
 graph TD
-    A[讀取輸入經文 txt] --> B{檢查現有 MD 檔案}
+    A[讀取輸入經文 txt] --> B{檢查現況與狀態感知}
     B -->|檔案不存在 / 為空| C[Stage 1: 全本全新銷文]
-    B -->|有斷點 Checkpoint| D[Stage 3b: 接續中斷修復]
-    B -->|存在遺漏字句| E[Stage 2: 初次精準補漏]
-    B -->|覆蓋率 100%| F[Stage 3a: AI 因明義理深度審查]
-    C --> E
-    E --> F
-    F -->|檢出問題| G[Stage 3b: 段落重寫 / 合併 / 去重]
-    G --> H[Stage 4: 二次安全補漏]
-    F -->|無問題| I[🎉 100% 完工交付]
+    B -->|有中斷 Checkpoint| D[Stage 3: 接續未完修復]
+    B -->|有有效 review.json| G[Stage 3: 依審查報告修復 / 合併 / 補漏]
+    B -->|檔案已就緒無報告| F[Stage 2: AI 因明義理深度審查與全局預檢]
+    C --> F
+    D --> G
+    F -->|檢出問題| G
+    G --> H[終局安全補漏核驗]
+    F -->|審查通過但有縫隙| H
+    F -->|無問題且覆蓋率 100%| I[🎉 100% 圓滿完工]
     H --> I
 ```
 
@@ -135,7 +144,7 @@ graph TD
                 [--dry-run] [--model MODEL]
                 [--reasoning-effort {low,medium,high}]
                 [--max-fix MAX_FIX] [--timeout TIMEOUT]
-                [--opencode] [--zen] [--base-url BASE_URL]
+                [--free-glm] [--opencode] [--zen] [--base-url BASE_URL]
                 [--api-key API_KEY] [--api-key-file API_KEY_FILE]
 
 必要參數:
@@ -157,11 +166,12 @@ graph TD
   --timeout TIMEOUT     單次 API 請求超時時間（秒，預設：300）
 
 端點與 API 金鑰:
-  --opencode, --go      ★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)
-  --zen                 使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)
-  --base-url BASE_URL   自訂相容 OpenAI 規範的 API 端點 URL
-  --api-key API_KEY     直接指定 API Key 字串
-  --api-key-file PATH   指定 API Key 檔案路徑
+  --free-glm, --glm5, --glm  ★ 使用 OpenRouter Free GLM 5.2 免費模型端點 (https://openrouter.ai/api/v1)
+  --opencode, --go           ★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)
+  --zen                      使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)
+  --base-url BASE_URL        自訂相容 OpenAI 規範的 API 端點 URL
+  --api-key API_KEY          直接指定 API Key 字串
+  --api-key-file PATH        指定 API Key 檔案路徑
 ```
 
 ---
