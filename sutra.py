@@ -114,6 +114,52 @@ class ReviewIssue:
 
 
 # ============================================================
+#  一、多金鑰輪換池管理器 (API Key Pool)
+# ============================================================
+class ApiKeyPool:
+    """多 API Key 負載與故障切換輪換池"""
+    def __init__(self, keys: List[str]):
+        self.keys = [k.strip() for k in keys if k and k.strip()]
+        self.current_idx = 0
+
+    def get_current_key(self) -> str:
+        if not self.keys:
+            return ""
+        return self.keys[self.current_idx]
+
+    def rotate(self) -> str:
+        """切換至下一把金鑰並回傳"""
+        if not self.keys:
+            return ""
+        self.current_idx = (self.current_idx + 1) % len(self.keys)
+        return self.keys[self.current_idx]
+
+    def rotate_client(self, client: Any, logger: logging.Logger, reason: str = "觸發限制/異常") -> str:
+        """切換下一把金鑰並直接同步更新 OpenAI Client"""
+        if not self.keys:
+            return ""
+        new_key = self.rotate()
+        if hasattr(client, "api_key"):
+            client.api_key = new_key
+        logger.warning(
+            f"    🔑 [金鑰輪換] {reason}，已自動切換至第 {self.current_idx + 1}/{len(self.keys)} 把 Key ({self.mask_key(new_key)})"
+        )
+        return new_key
+
+    def has_multiple(self) -> bool:
+        return len(self.keys) > 1
+
+    def mask_key(self, key: Optional[str] = None) -> str:
+        k = key or self.get_current_key()
+        if len(k) <= 10:
+            return "***"
+        return f"{k[:6]}...{k[-4:]}"
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+
+# ============================================================
 #  一、常數預編譯與古籍文字學映射
 # ============================================================
 RE_CLEAN_CJK = re.compile(r"[^\w\u4e00-\u9fa5]")
@@ -131,6 +177,9 @@ VARIANT_CHAR_MAP = str.maketrans({
     "沈": "沉", "祗": "祇", "袛": "祇", "衹": "祇",
     "只": "祇", "裏": "裡", "墮": "堕", "辨": "辯", "鷄": "雞",
 })
+
+# 全域 API 請求時間戳（用於免費模型/Gemini 頻率限制控制）
+_LAST_API_CALL_TIME = 0.0
 
 
 # ============================================================
@@ -248,8 +297,9 @@ def clean_markdown_content(raw_content: str) -> str:
     text = RE_CODE_FENCE_OPEN.sub("", text)
     text = RE_CODE_FENCE_CLOSE.sub("", text)
 
-    # 4. 移除【下一句預告】及其後所有文字與狀態碼
-    text = re.sub(r"(?:[\s#*`>]*【?下一句(?:預告)?】?[\s\S]*)", "", text, flags=re.IGNORECASE)
+    # 4. 嚴格限定僅移除獨立標題的【下一句預告】（必須有括號或明確標記，防止正文中的「下一句」被誤殺截斷）
+    text = re.sub(r"(?:(?:\n|^)[\s#*`>]*【\s*下一句(?:預告)?\s*】[\s\S]*)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:(?:\n|^)[\s#*`>]*🔹?\s*下一句預告[\s\S]*)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\[STATUS:\s*[^\]]*\][\s\S]*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"請問是否繼續銷文下一句[？?]?[\s\S]*", "", text)
 
@@ -309,15 +359,30 @@ def is_ignorable_gap(gap_text: str) -> bool:
 
 
 def validate_output_format(raw_content: str) -> Tuple[bool, List[str]]:
-    """驗證輸出格式是否包含全部必備結構（相容 Unicode 符號、Markdown 標題與粗體）"""
+    """驗證輸出格式是否包含全部必備結構（超強相容 Gemini / 各大模型之 Markdown 標題、粗體、清單與同義詞變體）"""
     required_sections = [
-        ("🔹 原典", r"🔹\s*(?:\*\*|#)*\s*原典|(?:\*\*|#)*\s*原典\s*(?:\*\*)*[：:]|【原典】"),
-        ("🔸 釋詞", r"🔸\s*(?:\*\*|#)*\s*釋詞|(?:\*\*|#)*\s*釋詞\s*(?:\*\*)*[：:]|【釋詞】"),
-        ("🔸 銷文", r"🔸\s*(?:\*\*|#)*\s*銷文|(?:\*\*|#)*\s*銷文\s*(?:\*\*)*[：:]|【銷文】"),
-        ("【詳解】", r"【詳解】|###\s*詳解|(?:\*\*)*\s*詳解\s*(?:\*\*)*[：:]"),
-        ("【義理通解】", r"【義理通解】|###\s*義理通解|(?:\*\*)*\s*義理通解\s*(?:\*\*)*[：:]"),
+        (
+            "🔹 原典",
+            r"🔹|原典\s*(?:\*\*)*[：:]|【\s*原典\s*】|#{1,4}\s*.*(?:原典|經文)|^[\s*`-]*\*{0,2}(?:原典|經文)\*{0,2}[：:]?"
+        ),
+        (
+            "🔸 釋詞",
+            r"🔸\s*(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞|名相)|(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*(?:\*\*)*[：:]?|【\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*】|#{1,4}\s*.*(?:釋詞|釋義|詞義|字詞|名相)|^[\s*`-]*\*{0,2}(?:釋詞|釋義|詞義|字詞解釋|名相解釋|名相釋義)\*{0,2}[：:]?"
+        ),
+        (
+            "🔸 銷文",
+            r"🔸\s*(?:\*\*|#)*\s*(?:銷文|消文|語譯|白話|白話語譯|經文消文)|(?:\*\*|#)*\s*(?:銷文|消文|語譯|白話語譯|白話解說|經文銷文|文義通釋)\s*(?:\*\*)*[：:]?|【\s*(?:銷文|消文|語譯|白話語譯|白話解說|經文銷文)\s*】|#{1,4}\s*.*(?:銷文|消文|語譯|白話)|^[\s*`-]*\*{0,2}(?:銷文|消文|語譯|白話語譯|白話銷文|經文語譯)\*{0,2}[：:]?"
+        ),
+        (
+            "【詳解】",
+            r"【\s*(?:詳解|詳細解析|義理詳解|經文詳解|深度剖析|解析|義理解析|詳細解說|經文剖析)\s*】|#{1,4}\s*.*(?:詳解|解析|剖析|義理解析)|(?:\*\*)*\s*(?:詳解|詳細解析|經文詳解|深度剖析|義理解析|詳細解說)\s*(?:\*\*)*[：:]?|^[\s*`-]*\*{0,2}(?:詳解|詳細解析|經文詳解|深度剖析|義理解析|詳細解說)\*{0,2}[：:]?"
+        ),
+        (
+            "【義理通解】",
+            r"【\s*(?:義理通解|義理闡釋|義理闡述|義理發微|義理貫通|義理|通解|教理通解|義理總結|實修啟發|心性啟發)\s*】|#{1,4}\s*.*(?:義理通解|義理闡釋|義理闡述|義理|通解|實修啟發|心性啟發)|(?:\*\*)*\s*(?:義理通解|義理闡述|義理闡釋|義理發微|義理貫通|義理|通解|教理通解|義理總結|實修啟發)\s*(?:\*\*)*[：:]?|^[\s*`-]*\*{0,2}(?:義理通解|義理闡釋|義理闡述|義理發微|義理貫通|義理|通解|教理通解|實修啟發)\*{0,2}[：:]?"
+        ),
     ]
-    missing = [name for name, pat in required_sections if not re.search(pat, raw_content)]
+    missing = [name for name, pat in required_sections if not re.search(pat, raw_content, flags=re.MULTILINE)]
     return (len(missing) == 0), missing
 
 
@@ -443,7 +508,11 @@ def request_and_validate_segment(
             g_parts.append(dup_guide)
         guideline_section = "\n".join(g_parts) + "\n\n"
 
-    for retry in range(3):
+    pool = getattr(client, "key_pool", None)
+    # 動態調整重試上限：多 Key 時確保每一把 Key 至少能輪流嘗試 2 遍
+    max_retries = max(len(pool) * 2, 6) if (pool and pool.has_multiple()) else 3
+
+    for retry in range(max_retries):
         problem_section = f"【本處病灶與修正建議】：\n{problem_desc}\n\n" if (problem_desc and not is_gap_mode) else ""
         feedback_section = f"\n【🚨 上一輪輸出未通過校驗，請依此指示修正】：\n{retry_feedback}\n" if retry_feedback else ""
 
@@ -465,7 +534,7 @@ def request_and_validate_segment(
                 user_prompt=user_msg,
                 reasoning_effort=reasoning_effort,
                 logger=logger,
-                action_name=f"{'補漏銷文' if is_gap_mode else '修復銷文'} (輪次 {loop_guard}, 重試 {retry + 1})"
+                action_name=f"{'補漏銷文' if is_gap_mode else '修復銷文'} (輪次 {loop_guard}, 重試 {retry + 1}/{max_retries})"
             )
 
             cleaned_reply = clean_markdown_content(raw_reply)
@@ -479,7 +548,8 @@ def request_and_validate_segment(
                 ):
                     return "<!-- DELETE -->", None, True
                 retry_feedback = "上一輪未能正確輸出包含『🔹 原典：「...」』的區塊，請嚴格按照輸出格式輸出。"
-                logger.warning(f"    ⚠️ [重試 {retry + 1}/3] 無法從輸出中解析出『🔹 原典』")
+                logger.warning(f"    ⚠️ [重試 {retry + 1}/{max_retries}] 無法從輸出中解析出『🔹 原典』")
+                time.sleep(1)
                 continue
 
             if "重複" in issue_type and (
@@ -496,7 +566,8 @@ def request_and_validate_segment(
             )
             if not valid:
                 retry_feedback = f"【校驗未通過 ({err_type})】：{err_advice}"
-                logger.warning(f"    ⚠️ [重試 {retry + 1}/3] 品質校驗未通過 ({err_type})：{err_advice}")
+                logger.warning(f"    ⚠️ [重試 {retry + 1}/{max_retries}] 品質校驗未通過 ({err_type})：{err_advice}")
+                time.sleep(1)
                 continue
 
             fmt_ok, missing = validate_output_format(cleaned_reply)
@@ -504,7 +575,9 @@ def request_and_validate_segment(
                 if "重複" in issue_type and len(normalize_text(extracted_sent)) == 0:
                     return "<!-- DELETE -->", None, True
                 retry_feedback = f"【格式不完整】：輸出缺少必要段落 {missing}，請務必完整輸出所有必備欄位。"
-                logger.warning(f"    ⚠️ [重試 {retry + 1}/3] 格式缺少必要欄位：{missing}")
+                logger.warning(f"    ⚠️ [重試 {retry + 1}/{max_retries}] 格式缺少必要欄位：{missing}")
+                logger.warning(f"    🔍 [Gemini 實際輸出內容如下]：\n{'-'*60}\n{cleaned_reply}\n{'-'*60}")
+                time.sleep(1)
                 continue
 
             return cleaned_reply, extracted_sent, False
@@ -514,18 +587,34 @@ def request_and_validate_segment(
             raise
         except Exception as e:
             err_msg = str(e)
-            quota_keywords = [
-                "Insufficient balance", "CreditsError", "AuthenticationError",
-                "invalid_api_key", "401", "GoUsageLimitError", "usage limit reached",
-                "insufficient_quota", "RateLimitError"
-            ]
-            if any(kw.lower() in err_msg.lower() for kw in quota_keywords):
-                logger.error(f"❌ API 金鑰無效、額度耗盡或觸發使用限制 ({err_msg})！流水線立即安全中止並保存進度。")
-                return None, None, True
-            backoff_time = (retry + 1) * 3
+            
+            # 若金鑰池有多把 Key，無論 429、401、配額耗盡皆直接輪轉下一把 Key
+            if pool and pool.has_multiple():
+                pool.rotate_client(client, logger, reason=f"API 請求異常 ({e})")
+                is_gemini = "gemini" in model.lower() or "googleapis" in str(client.base_url).lower()
+                backoff_time = 30 if is_gemini else 2  # Gemini 遭遇 429/異常時冷卻 30 秒再試
+            else:
+                fatal_keywords = [
+                    "Insufficient balance", "CreditsError", "AuthenticationError",
+                    "invalid_api_key", "401", "402", "Payment Required"
+                ]
+                if any(kw.lower() in err_msg.lower() for kw in fatal_keywords):
+                    logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！流水線立即安全中止並保存進度。")
+                    return None, None, True
+
+                is_free_or_rate_limit = (
+                    ":free" in model.lower()
+                    or "openrouter" in str(client.base_url).lower()
+                    or "googleapis" in str(client.base_url).lower()
+                    or "429" in err_msg
+                    or "rate" in err_msg.lower()
+                    or "quota" in err_msg.lower()
+                )
+                backoff_time = 30 if is_free_or_rate_limit else (retry + 1) * 3
+
             logger.error(
                 f"    ❌ API 呼叫失敗 ({e})，當前待處理經文剩餘 {len(normalize_text(remaining_text))} 字，"
-                f"等待 {backoff_time} 秒後進行第 {retry + 1}/3 次重試..."
+                f"等待 {backoff_time} 秒後進行第 {retry + 1}/{max_retries} 次重試..."
             )
             time.sleep(backoff_time)
 
@@ -1153,6 +1242,7 @@ FIX_SYSTEM = """【角色設定】
 【重寫與義理切分規範】：
 1. 【起點嚴格、字字精確】：輸出的「🔹 原典」必須嚴格從指定的剩餘經文第一個字開始，一字不差，絕對禁止省略號（...、（中略））。
 2. 【適切粒度與自然切分】：
+   - ★【偈頌整偈原則（防半偈/防單句）】：遇到五言或七言偈頌時，【必須以整偈（4句）為最小銷文單元】（五言 20 字、七言 28 字，或兩整偈 40/56 字）。【絕對嚴禁輸出單句（7字）或半偈（14字）】；若待處理經文為 5 句或 6 句等非標準倍數，請將多出的 1~2 句直接合併為一整單元銷文，切勿在末尾留下不足一整偈的殘句。
    - ★【語意自足與拒絕過度碎化】：切分出的單元應具備完整的講述主題。精練問答（如「王言：不也。」）、法相標題、獨立設問句雖短亦可獨立成段；但【嚴禁將密集排比名相、連續句列（如「X句非X句」、「見X、見Y」）逐逗號生硬拆成數個字的碎片】。
    - ★【密集排比與名相列舉之分組原則】：遇到密集連續的名相列舉或對稱句群時，請依義理類別自然組合為適中單元（約 20～50 字，或 3～5 組排比）進行統攝銷釋，避免支離破碎與過度重複。
    - ★【最適講經單元與長文推進】：單次銷文的最適原典篇幅約為【20～50 字】（或一完整句義、一整偈、一組法相轉折）。若待銷文經文較長（含多個獨立句讀或不同層次法相），【嚴禁一次全數吞併銷文】！請務必僅截取【開頭第一個主題自足的完整子單元】（約 20～50 字）進行銷文，後續經文系統會在下一輪自動推進。
@@ -1184,9 +1274,27 @@ def stream_completion(
     action_name: str = "LLM 呼叫"
 ) -> str:
     """封裝串流 LLM 呼叫，具備 Token 上限校準、思考心跳與自動降級機制"""
-    # OpenRouter / GLM 等免費模型單次上限通常為 4096~65536，DeepSeek 則可設較大
-    is_openrouter_or_glm = ":free" in model or "glm" in model.lower() or "openrouter" in str(client.base_url)
-    max_tokens_val = 65536 if is_openrouter_or_glm else 384000
+    global _LAST_API_CALL_TIME
+
+    # OpenRouter / GLM / Gemini 等第三方免費模型單次上限適配，DeepSeek 官方則可設較大
+    is_third_party_or_free = (
+        ":free" in model.lower()
+        or "glm" in model.lower()
+        or "gemini" in model.lower()
+        or "openrouter" in str(client.base_url).lower()
+        or "googleapis" in str(client.base_url).lower()
+    )
+    max_tokens_val = 65536 if is_third_party_or_free else 384000
+
+    # ★ OpenRouter Free 與 Gemini 請求頻率管控：確保兩次請求間隔至少 15 秒
+    if is_third_party_or_free:
+        now = time.time()
+        elapsed = now - _LAST_API_CALL_TIME
+        if elapsed < 15.0:
+            wait_seconds = 15.0 - elapsed
+            logger.info(f"  ⏳ [頻率管控] OpenRouter Free / Gemini 冷卻中，等待 {wait_seconds:.1f} 秒後發送請求...")
+            time.sleep(wait_seconds)
+        _LAST_API_CALL_TIME = time.time()
 
     create_kwargs = {
         "model": model,
@@ -1198,7 +1306,7 @@ def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if reasoning_effort and not is_openrouter_or_glm:
+    if reasoning_effort and not is_third_party_or_free:
         create_kwargs["extra_body"] = {
             "thinking": {"type": "enabled"},
             "reasoning_effort": reasoning_effort,
@@ -1259,7 +1367,11 @@ def stream_completion(
     if target_usage_source:
         log_cache_metrics(logger, target_usage_source, action_name=action_name)
 
-    return "".join(content_parts)
+    full_output = "".join(content_parts)
+    if getattr(client, "debug_mode", False):
+        logger.info(f"\n{'='*25} 🤖 [AI 原始完整輸出 RAW] {'='*25}\n{full_output}\n{'='*75}\n")
+
+    return full_output
 
 
 def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
@@ -1538,10 +1650,14 @@ def fix_single_issue(
 
     # 完全重複段落快速直通（使用已適配的 gap_text 變數）
     if "重複" in issue_type_str and not is_gap_fix and not gap_text:
-        is_full_delete = any(kw in problem_desc for kw in ["應刪除", "建議刪除", "應予刪除", "完全重複", "重複應刪除", "請刪除"]) and not any(
-            kw in problem_desc for kw in ["保留", "部分", "重新切分", "拆分", "前綴", "首句", "末句", "首二句", "移回", "補齊", "補全"]
-        )
-        if is_full_delete:
+        has_delete_intent = any(kw in problem_desc for kw in [
+            "應刪除", "建議刪除", "應予刪除", "完全重複", "重複應刪除",
+            "請刪除", "直接刪除", "應直接刪除", "整段刪除", "刪除重複", "刪除本段"
+        ])
+        has_partial_keep = any(kw in problem_desc for kw in [
+            "保留", "重新切分", "拆分", "前綴", "首句", "末句", "首二句", "移回", "補齊", "補全", "部分保留", "僅刪除"
+        ])
+        if has_delete_intent and not has_partial_keep:
             logger.info(f"  🗑️ 判定為完全重複段落，直接標記刪除：段落 {valid_merge_idx}")
             if on_step_done and callable(on_step_done):
                 on_step_done(valid_merge_idx, "<!-- DELETE -->")
@@ -1858,7 +1974,7 @@ REVIEW_SYSTEM = """你是精通三藏文法、因明論理、佛經科判與講�
 我們追求的是【微觀句意自足、宏觀利於深解】，審查需兼顧【防割裂（合併）】與【防臃腫（拆分）】雙向平衡。
 ★【防崩潰與防碎片化鐵律】：
    1. 嚴禁滾雪球式強行合併過長大段（>120字），嚴防輸出超時與邏輯混雜。
-   2. 亦嚴禁將密集排比、連續名相句列逐逗號切成極短碎片（如單切「幻句非幻句」5字），應保持適當群組（約 20～70 字）以利統攝發揮！
+   2. 【碎片化之嚴格定義】：僅針對無序號、無獨立說明的密集短詞連綴（如《楞伽經》百八句「生非生、常非常、因非因」等純句列），此類才需群組；凡帶有序號或名相之條目，一律非碎片化，絕不可合併！
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🟥 一、何時【必須通報合併】？（修復實質語法割裂 -> merge_indices 填 [相鄰段落]）
@@ -1880,9 +1996,10 @@ REVIEW_SYSTEM = """你是精通三藏文法、因明論理、佛經科判與講�
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🟩 三、何時【堅決放行免審（核心豁免原則）】？（重要！絕對嚴禁通報合併或拆分！）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ★【對稱列舉之法相條目（一者...二者...三者...）—— 堅決放行！】：每一子條目各自承載獨立法相定義，皆屬極佳之微觀剖析單元，嚴禁強行合併。
-2. ★【設問徵起、總標句與精簡問答（「所以者何」、「何以故」、「王言：不也。」）—— 堅決放行！】：單獨成段極利於提綱挈領與發起問端，完全合法，嚴禁通報。
-3. ★【篇幅適中之獨立段落（< 100 字）—— 堅決放行！】：只要內部文意自足，即使包含設問與別釋、譬喻與法合，皆屬標準段落，嚴禁過度挑刺拆分。
+1. ★【帶序號或名相之列舉條目（一者...二者...三者...）—— 堅決放行！】：凡帶數字序號或法相標籤之條目（如「一者、諦實故；」「一者、觀待道理；」），無論字數多短，皆屬標準科判單元，【絕對禁止】通報為「斷句邊界錯位」或要求合併！
+2. ★【明確區分】：僅針對如《楞伽經》百八句那種「無序號之極短純詞彙連綴（生非生、常非常）」才需適度群組；只要是帶有序號的法相列舉，單獨成段完全合法，堅決放行！
+3. ★【設問徵起、總標句與精簡問答（「所以者何」、「何以故」、「王言：不也。」）—— 堅決放行！】：單獨成段極利於提綱挈領與發起問端，完全合法，嚴禁通報。
+4. ★【篇幅適中之獨立段落（< 100 字）—— 堅決放行！】：只要內部文意自足，即使包含設問與別釋、譬喻與法合，皆屬標準段落，嚴禁過度挑刺拆分。
 
 輸出格式：嚴格輸出 JSON 陣列，不要任何 markdown 標籤或無關廢話。
 [{"index": 段落編號, "type": "斷句邊界錯位|字詞腰斬|半偈殘篇|條件句腰斬|單段過長需拆分|重複內容", "problem": "簡述具體語法錯置原因與正確邊界切分建議", "merge_indices": [要處理的段落編號, 如邊界錯位填 [42, 43]，單段拆分填 [29]]}]
@@ -1913,7 +2030,10 @@ def ai_review(
 
     logger.info(f"AI 審查：正在進行全局語意流暢度與因明攻防邏輯校驗（共 {len(segments)} 段）...")
 
-    for retry in range(3):
+    pool = getattr(client, "key_pool", None)
+    max_retries = max(len(pool) * 2, 5) if (pool and pool.has_multiple()) else 3
+
+    for retry in range(max_retries):
         try:
             text = stream_completion(
                 client=client,
@@ -1922,7 +2042,7 @@ def ai_review(
                 user_prompt=user_msg,
                 reasoning_effort=reasoning_effort,
                 logger=logger,
-                action_name="AI 斷句審查"
+                action_name=f"AI 斷句審查 (重試 {retry + 1}/{max_retries})"
             ).strip()
 
             text = RE_THINK_TAG.sub("", text).strip()
@@ -1984,14 +2104,33 @@ def ai_review(
             raise
         except Exception as e:
             err_msg = str(e)
-            if any(kw in err_msg for kw in ["Insufficient balance", "CreditsError", "AuthenticationError", "invalid_api_key", "insufficient_quota", "Payment Required", "401", "402"]):
-                logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！請至平台儲值或更換 API Key。")
-                return None
-            backoff = (retry + 1) * 3
-            logger.error(f"  ❌ AI 審查呼叫失敗 ({e})，等待 {backoff} 秒後進行第 {retry+1}/3 次重試...")
+            if pool and pool.has_multiple():
+                pool.rotate_client(client, logger, reason=f"AI 審查遭遇限制/異常 ({e})")
+                is_gemini = "gemini" in model.lower() or "googleapis" in str(client.base_url).lower()
+                backoff = 30 if is_gemini else 2  # Gemini 遭遇限制時等待 30 秒
+            else:
+                fatal_keywords = [
+                    "Insufficient balance", "CreditsError", "AuthenticationError",
+                    "invalid_api_key", "401", "402", "Payment Required"
+                ]
+                if any(kw.lower() in err_msg.lower() for kw in fatal_keywords):
+                    logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！請至平台儲值或更換 API Key。")
+                    return None
+
+                is_free_or_rate_limit = (
+                    ":free" in model.lower()
+                    or "openrouter" in str(client.base_url).lower()
+                    or "googleapis" in str(client.base_url).lower()
+                    or "429" in err_msg
+                    or "rate" in err_msg.lower()
+                    or "quota" in err_msg.lower()
+                )
+                backoff = 30 if is_free_or_rate_limit else (retry + 1) * 3
+
+            logger.error(f"  ❌ AI 審查呼叫失敗 ({e})，等待 {backoff} 秒後進行第 {retry+1}/{max_retries} 次重試...")
             time.sleep(backoff)
 
-    logger.error("❌ AI 審查重試 3 次皆失敗，放棄本次審查。")
+    logger.error(f"❌ AI 審查重試 {max_retries} 次皆失敗，放棄本次審查。")
     return None
 
 
@@ -2638,7 +2777,10 @@ def detect_current_state(
         logger.info("🔍 [狀態感知] 銷文 MD 檔案無有效段落，將從頭啟動【全本銷文】。")
         return PipelineState.NEED_GENERATE, {}
 
-    # 3. 檢查是否有未執行的有效 review.json
+    # 3. 檢查是否有未執行的有效 review.json（嚴格依賴時間戳校驗，避免舊空報告誤判）
+    gaps = find_missing_gaps(sutra_text, segments)
+    gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in gaps)
+
     if is_review_json_valid(review_path, output_path, segments):
         with open(review_path, "r", encoding="utf-8") as f:
             issues = json.load(f)
@@ -2646,9 +2788,6 @@ def detect_current_state(
             logger.info(f"🔍 [狀態感知] 檢測到有效的審查報告 ({len(issues)} 處問題)，直接進入【修復階段】。")
             return PipelineState.NEED_REVIEW_FIX, {"issues": issues}
         else:
-            # 審查報告 0 問題，核驗最終覆蓋率
-            gaps = find_missing_gaps(sutra_text, segments)
-            gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in gaps)
             if gaps and gap_chars > 0:
                 logger.info(f"🔍 [狀態感知] 審查通過但仍殘留 {len(gaps)} 處縫隙 ({gap_chars} 字)，進入【終局安全補漏】。")
                 return PipelineState.NEED_GAP_FILL, {"gaps": gaps}
@@ -2748,11 +2887,11 @@ def run_pipeline(
                 break
 
             review_path = os.path.splitext(output_path)[0] + "_review.json"
-            try:
-                with open(review_path, "w", encoding="utf-8") as f:
-                    json.dump([], f)
-            except Exception:
-                pass
+            if os.path.exists(review_path):
+                try:
+                    os.remove(review_path)
+                except Exception:
+                    pass
 
         elif state == PipelineState.NEED_GAP_FILL:
             logger.info("\n🔍 === [終局安全核驗] 執行微小縫隙安全補漏 ===")
@@ -2763,73 +2902,110 @@ def run_pipeline(
 # ============================================================
 #  十一、金鑰讀取與輔助入口
 # ============================================================
-def load_api_key(
+def load_api_keys(
     key_file: Optional[str] = None,
     api_key_str: Optional[str] = None,
     is_opencode: bool = False,
-    is_free_glm: bool = False
-) -> Optional[str]:
-    """讀取 API Key：命令列參數 > 環境變數 > 檔案"""
+    is_free_glm: bool = False,
+    is_gemini: bool = False
+) -> Optional[ApiKeyPool]:
+    """讀取多 API Key 並構建 ApiKeyPool（支援多行、註解、逗號分隔）"""
+    keys: List[str] = []
+
+    def _parse_keys(raw: str) -> List[str]:
+        res = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("//"):
+                continue
+            for piece in re.split(r"[,;]+", line):
+                piece = piece.strip().strip("'\"")
+                if piece and not piece.startswith("#") and piece not in res:
+                    res.append(piece)
+        return res
+
     if api_key_str and api_key_str.strip():
-        return api_key_str.strip()
+        keys.extend(_parse_keys(api_key_str))
 
-    if is_free_glm:
-        env_vars = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
-    elif is_opencode:
-        env_vars = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
-    else:
-        env_vars = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+    if not keys:
+        if is_gemini:
+            env_vars = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
+        elif is_free_glm:
+            env_vars = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
+        elif is_opencode:
+            env_vars = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
+        else:
+            env_vars = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
 
-    for var in env_vars:
-        val = os.environ.get(var)
-        if val and val.strip():
-            return val.strip()
+        for var in env_vars:
+            val = os.environ.get(var)
+            if val and val.strip():
+                parsed = _parse_keys(val)
+                if parsed:
+                    keys.extend(parsed)
+                    break
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate_files = []
-    if key_file:
-        candidate_files.append(key_file)
+    if not keys:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate_files = []
+        if key_file:
+            candidate_files.append(key_file)
 
-    if is_free_glm:
-        candidate_files.extend([
-            os.path.join(base_dir, "openrouter_key.txt"),
-            os.path.join(base_dir, "openrouter_api_key.txt"),
-            os.path.join(base_dir, "glm_key.txt"),
-            os.path.join(base_dir, "api_key.txt"),
-        ])
-    elif is_opencode:
-        candidate_files.extend([
-            os.path.join(base_dir, "opencode_key.txt"),
-            os.path.join(base_dir, "opencode_api_key.txt"),
-            os.path.join(base_dir, "api_key.txt"),
-        ])
-    else:
-        candidate_files.extend([
-            os.path.join(base_dir, "api_key.txt"),
-            os.path.join(base_dir, "deepseek_key.txt"),
-            os.path.join(base_dir, "deepseek_api_key.txt"),
-            os.path.join(base_dir, "key.txt"),
-        ])
+        if is_gemini:
+            candidate_files.extend([
+                os.path.join(base_dir, "gemini_key.txt"),
+                os.path.join(base_dir, "google_key.txt"),
+                os.path.join(base_dir, "gemini_api_key.txt"),
+                os.path.join(base_dir, "api_key.txt"),
+            ])
+        elif is_free_glm:
+            candidate_files.extend([
+                os.path.join(base_dir, "openrouter_key.txt"),
+                os.path.join(base_dir, "openrouter_api_key.txt"),
+                os.path.join(base_dir, "glm_key.txt"),
+                os.path.join(base_dir, "api_key.txt"),
+            ])
+        elif is_opencode:
+            candidate_files.extend([
+                os.path.join(base_dir, "opencode_key.txt"),
+                os.path.join(base_dir, "opencode_api_key.txt"),
+                os.path.join(base_dir, "api_key.txt"),
+            ])
+        else:
+            candidate_files.extend([
+                os.path.join(base_dir, "api_key.txt"),
+                os.path.join(base_dir, "deepseek_key.txt"),
+                os.path.join(base_dir, "deepseek_api_key.txt"),
+                os.path.join(base_dir, "key.txt"),
+            ])
 
-    for kf in candidate_files:
-        if os.path.exists(kf):
-            with open(kf, "r", encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                return key
+        for kf in candidate_files:
+            if os.path.exists(kf):
+                with open(kf, "r", encoding="utf-8") as f:
+                    content = f.read()
+                parsed = _parse_keys(content)
+                if parsed:
+                    keys.extend(parsed)
+                    break
 
-    if is_free_glm:
-        target_name = "openrouter_key.txt (或 glm_key.txt / api_key.txt)"
-        env_hint = "OPENROUTER_API_KEY / OPENAI_API_KEY"
-    elif is_opencode:
-        target_name = "opencode_key.txt (或 api_key.txt)"
-        env_hint = "OPENCODE_API_KEY / OPENAI_API_KEY"
-    else:
-        target_name = "api_key.txt"
-        env_hint = "DEEPSEEK_API_KEY / OPENAI_API_KEY"
+    if not keys:
+        if is_gemini:
+            target_name = "gemini_key.txt (或 google_key.txt / api_key.txt)"
+            env_hint = "GEMINI_API_KEY / GOOGLE_API_KEY"
+        elif is_free_glm:
+            target_name = "openrouter_key.txt (或 glm_key.txt / api_key.txt)"
+            env_hint = "OPENROUTER_API_KEY / OPENAI_API_KEY"
+        elif is_opencode:
+            target_name = "opencode_key.txt (或 api_key.txt)"
+            env_hint = "OPENCODE_API_KEY / OPENAI_API_KEY"
+        else:
+            target_name = "api_key.txt"
+            env_hint = "DEEPSEEK_API_KEY / OPENAI_API_KEY"
 
-    print(f"❌ 找不到金鑰檔案或內容為空，請建立 {target_name} 或設定環境變數 ({env_hint})")
-    return None
+        print(f"❌ 找不到金鑰檔案或內容為空，請建立 {target_name} 或設定環境變數 ({env_hint})")
+        return None
+
+    return ApiKeyPool(keys)
 
 
 def auto_output_path(input_file: str) -> str:
@@ -2856,10 +3032,12 @@ def main():
     mode_group.add_argument("--fix", action="store_true", help="手動指定：僅讀取 review.json 執行修正")
 
     parser.add_argument("--dry-run", action="store_true", help="預覽待修清單，不呼叫 API 且不更動檔案（配合 --fix 使用）")
+    parser.add_argument("--debug", action="store_true", help="★ 開啟除錯輸出，即時印出 Gemini 每一次產出的完整原始內容 (Raw Output)")
     parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="呼叫模型名稱")
     parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
+    parser.add_argument("--gemini", "--google", action="store_true", dest="gemini", help="★ 使用 Google AI Studio Gemini 免費端點 (https://generativelanguage.googleapis.com/v1beta/openai/)")
     parser.add_argument("--free-glm", "--glm5", "--glm", action="store_true", dest="free_glm", help="★ 使用 OpenRouter Free GLM 5.2 免費模型端點 (https://openrouter.ai/api/v1)")
     parser.add_argument("--opencode", "--go", action="store_true", dest="opencode", help="★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)")
     parser.add_argument("--zen", action="store_true", help="使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)")
@@ -2899,8 +3077,14 @@ def main():
 
     is_opencode_provider = args.opencode or args.zen
     is_free_glm_provider = args.free_glm
+    is_gemini_provider = args.gemini
 
-    if args.free_glm:
+    if args.gemini:
+        base_url = args.base_url or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        provider_name = "Google AI Studio (Gemini Free 每日 1500 額度)"
+        if args.model == "deepseek-v4-flash":
+            args.model = "gemini-flash-latest"
+    elif args.free_glm:
         base_url = args.base_url or "https://openrouter.ai/api/v1"
         provider_name = "OpenRouter Free GLM 5.2 (https://openrouter.ai/api/v1)"
         if args.model == "deepseek-v4-flash":
@@ -2915,17 +3099,24 @@ def main():
         base_url = args.base_url or "https://api.deepseek.com"
         provider_name = "DeepSeek 官方 API"
 
-    api_key = load_api_key(
+    key_pool = load_api_keys(
         key_file=args.api_key_file,
         api_key_str=args.api_key,
         is_opencode=is_opencode_provider,
-        is_free_glm=is_free_glm_provider
+        is_free_glm=is_free_glm_provider,
+        is_gemini=is_gemini_provider
     )
-    if not api_key:
+    if not key_pool:
         return
 
-    logger.info(f"API 提供商: {provider_name} ({base_url}) | 模型: {args.model}")
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=args.timeout)
+    init_key = key_pool.get_current_key()
+    logger.info(
+        f"API 提供商: {provider_name} ({base_url}) | 模型: {args.model} | "
+        f"金鑰池: 共載入 {len(key_pool)} 把 Key (初始: {key_pool.mask_key(init_key)})"
+    )
+    client = OpenAI(api_key=init_key, base_url=base_url, timeout=args.timeout)
+    client.key_pool = key_pool  # 綁定金鑰池至 client 物件
+    client.debug_mode = args.debug  # 綁定 debug 模式開關
 
     # 明確乾淨的模式路由
     if args.auto:
