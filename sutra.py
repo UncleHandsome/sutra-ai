@@ -356,7 +356,7 @@ def clean_markdown_content(raw_content: str) -> str:
 
     # 1. 移除寒暄問候（擴充常見 AI 前綴詞，徹底清理廢話）
     text = re.sub(
-        r"^(?:(?:南無)?阿彌陀佛[。，！\s]*\n*|施主[^\n]*\n+|好的[，、。！：:\s]*(?:我們現在|現在|這就|以下|為您|開始|這便)[^\n]*\n+)+",
+        r"^(?:(?:南無)?阿彌陀佛[。，！\s]*\n*|施主[^\n]*\n+|好的[，、。！：:\s]*(?:我們現在|現在|這就|以下|為您|開始|這便|依據)[^\n]*(?:\n+|$))+",
         "",
         text,
         flags=re.IGNORECASE
@@ -543,29 +543,7 @@ def verify_sentence_quality(
                     f"輸出的原典文字與當前起點不符！請嚴格從『{expected_start}...』第一個字開始一字不差照抄。"
                 )
 
-    # 4. 品題/論題/夾註豁免
-    title_pattern = (
-        r"^(?:.*?[品卷章分地](?:第[一二三四五六七八九十百千\d]+)?(?:之[一二三四五六七八九十\d]+)?"
-        r"|第[一二三四五六七八九十百千\d]+[品卷章分地]|.+品|本地分.*|入菩薩行論.*|大乘.*)$"
-    )
-    is_title = bool(
-        re.match(title_pattern, sentence_text.strip())
-        or "品第" in sentence_text
-        or "分中" in sentence_text
-        or sentence_text.strip().endswith("品")
-    ) and len(clean_s_text) <= 60
-    is_annotation = bool(re.match(r"^[\(（\[【〔〈《].*?[\)）\]】〕〉》]$", sentence_text.strip())) and len(clean_s_text) <= 30
-
-    # 5. 偈頌音律分析
-    clauses_s = [
-        RE_CLEAN_CJK.sub("", c)
-        for c in re.split(r"[，。！？；、：\s\n　]", sentence_text)
-        if RE_CLEAN_CJK.sub("", c)
-    ]
-    is_5_rhythm = (all(len(c) in [5, 10, 15, 20] for c in clauses_s) and len(clean_s_text) % 5 == 0) if clauses_s else (len(clean_s_text) >= 5 and len(clean_s_text) % 5 == 0)
-    is_7_rhythm = (all(len(c) in [7, 14, 21, 28] for c in clauses_s) and len(clean_s_text) % 7 == 0) if clauses_s else (len(clean_s_text) >= 7 and len(clean_s_text) % 7 == 0)
-
-    # 設問句（所以者何、何以故、云何等）在講經銷文中為合法徵起/總標，完全放行
+    # 設問句、法相標題、完整偈頌與自足義理單元均已通過起點與非空檢驗，放行
     return True, None, None
 
 # ============================================================
@@ -1164,7 +1142,7 @@ def safe_write_file(filepath: str, content: str) -> None:
                 else:
                     with open(emergency_path, "w", encoding="utf-8") as ef:
                         ef.write(content)
-                logging.getLogger("sutra_review").error(
+                logging.error(
                     f"❌ 檔案寫入完全被系統鎖定 ({final_err})，已將進度緊急另存為：{emergency_path}"
                 )
             except Exception:
@@ -1248,7 +1226,7 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
         if s.strip() and s.strip() != "---"
     ]
 
-    # ★ 關鍵修復：提取所有段落前，將正文前出現的所有導讀、前言與序文完整保留並併入 header
+    # ★ 關鍵修復：提取所有段落前，將正文前出現的所有導讀、前言與序文完整保留並併入 header（具備防重複疊加檢查）
     raw_sections = []
     found_first_valid = False
     prefix_notes = []
@@ -1258,8 +1236,9 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
                 found_first_valid = True
                 raw_sections.append(b)
             else:
-                if b.strip():
-                    prefix_notes.append(b.strip())
+                b_str = b.strip()
+                if b_str and b_str not in header:
+                    prefix_notes.append(b_str)
         else:
             raw_sections.append(b)
 
@@ -1802,18 +1781,19 @@ def fix_single_issue(
     output_path: Optional[str] = None
 ) -> Tuple[Optional[str], List[int]]:
     """針對特定審查問題進行段落合併重寫"""
-    # 支援物件與字典雙重存取
+    # 支援物件與字典雙重存取（確保 merge_indices 為空時能保底退回 index）
     if hasattr(issue, "merge_indices"):
-        merge_idx = sorted(list(set(issue.merge_indices)))
-        issue_type_str = issue.issue_type
-        problem_desc = issue.problem
-        gap_text = issue.gap_text or ""
-        position = issue.position
+        raw_m = issue.merge_indices if (issue.merge_indices and len(issue.merge_indices) > 0) else [getattr(issue, "index", 0)]
+        merge_idx = sorted(list(set(raw_m)))
+        issue_type_str = getattr(issue, "issue_type", "")
+        problem_desc = getattr(issue, "problem", "")
+        gap_text = getattr(issue, "gap_text", "") or ""
+        position = getattr(issue, "position", None)
     else:
         merge_idx = sorted(list(set(issue.get("merge_indices") or [issue.get("index", 0)])))
         issue_type_str = issue.get("type", "")
         problem_desc = issue.get("problem", "")
-        gap_text = issue.get("gap_text", "")
+        gap_text = issue.get("gap_text", "") or ""
         position = issue.get("position")
 
     valid_merge_idx = [i for i in merge_idx if 0 <= i < len(segments)]
@@ -2112,18 +2092,15 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             ))
             continue
 
-        # 2. 開頭標點殘肢
-        if i > 0 and raw_seg.startswith(("，", "、", "；", "。", "！", "？", "：")):
-            prev_seg = segments[i - 1].strip()
-            prev_pure_end = re.sub(r"[\s」』”\"\'\)）］】〕＞》〉]+$", "", prev_seg)
-            if prev_pure_end and prev_pure_end[-1] in ["，", "、", "：", "；", "—", "-"]:
-                issues.append(ReviewIssue(
-                    index=i - 1,
-                    issue_type="開頭標點殘肢",
-                    problem=f"段落開頭為標點「{raw_seg[0]}」且前段未完，應與前段合併",
-                    merge_indices=[i - 1, i],
-                ))
-                continue
+        # 2. 開頭標點殘肢（支援單段本地免 API 快速清洗）
+        if raw_seg.startswith(("，", "、", "；", "。", "！", "？", "：", "）", ")", "］", "]", "】", "〕", "＞", "》", "〉")):
+            issues.append(ReviewIssue(
+                index=i,
+                issue_type="開頭標點殘肢",
+                problem=f"段落開頭多出孤立標點「{raw_seg[0]}」，應直接去除開頭標點殘肢",
+                merge_indices=[i],
+            ))
+            continue
 
         # 3. 物理碎首檢測（僅在與前段在經文中實質相鄰時才判定合併，防止跨越漏段誤合併）
         prev_start_p = seg_idx_to_pos.get(i - 1, -1) if i > 0 else -1
@@ -2451,10 +2428,17 @@ def merge_overlapping_issues(
             gap_text = x.get("gap_text")
             position = x.get("position")
 
-        valid_indices = [
-            i for i in raw_indices
-            if (effective_max is None or (isinstance(i, int) and 0 <= i < effective_max))
-        ]
+        valid_indices = []
+        for i in raw_indices:
+            if isinstance(i, int):
+                val = i
+            elif isinstance(i, str) and i.strip().isdigit():
+                val = int(i.strip())
+            else:
+                continue
+            if effective_max is None or (0 <= val < effective_max):
+                valid_indices.append(val)
+
         if not valid_indices:
             continue
 
@@ -2634,7 +2618,7 @@ def run_fill_gaps(
             valid_secs = [s for s in cur_sections if s.strip() and s.strip() != "---"]
             clean_header = header.strip()
             if clean_header and valid_secs:
-                combined_body = f"{clean_header}\n\n---\n\n" + "\n\n---\n\n".join(valid_secs) + "\n"
+                combined_body = f"{clean_header}\n\n" + "\n\n---\n\n".join(valid_secs) + "\n"
             elif clean_header:
                 combined_body = f"{clean_header}\n"
             else:
@@ -3024,7 +3008,18 @@ def detect_current_state(
     covered_chars = max(0, norm_sutra_len - gap_chars)
     coverage_pct = (covered_chars / max(1, norm_sutra_len)) * 100
 
-    # 3. 檢查是否有已生成的審查報告
+    # ★★★ 3. 優先關鍵判斷：銷文是否中途停止推進（覆蓋率 < 95% 且文末未完時，絕不提前進入修復）★★★
+    tail_gaps = [g for g in gaps if getattr(g, "position", "") == "tail"]
+    tail_gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in tail_gaps)
+
+    if tail_gap_chars >= 25 or (coverage_pct < 95.0 and tail_gap_chars > 0):
+        logger.info(
+            f"🔍 [狀態感知] 檢測到目前經文覆蓋率為 {coverage_pct:.1f}%，且文末尚有 {tail_gap_chars} 字未產出。\n"
+            f"   👉 智慧判定為【銷文中途停止】，自動無縫接軌繼續推進銷文（不提前調用 AI 審查）！"
+        )
+        return PipelineState.NEED_GENERATE, {}
+
+    # 4. 檢查是否有已生成的審查報告（初稿整體完成後才讀取）
     if is_review_json_valid(review_path, output_path, segments):
         issues = None
         try:
@@ -3043,18 +3038,6 @@ def detect_current_state(
             else:
                 logger.info("🔍 [狀態感知] 審查報告 0 問題且經文覆蓋率 100%，流程已圓滿完成！")
                 return PipelineState.COMPLETED, {}
-
-    # ★★★ 4. 關鍵智慧判斷：區分【中途停止推進】vs【初稿已完成待審查】★★★
-    tail_gaps = [g for g in gaps if getattr(g, "position", "") == "tail"]
-    tail_gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in tail_gaps)
-
-    # 判斷條件：若尾部遺漏超過 25 字，或整體覆蓋率 < 95% 且尾部未完，代表「銷文進行到一半被中斷」
-    if tail_gap_chars >= 25 or (coverage_pct < 95.0 and tail_gap_chars > 0):
-        logger.info(
-            f"🔍 [狀態感知] 檢測到目前經文覆蓋率為 {coverage_pct:.1f}%，且文末尚有 {tail_gap_chars} 字未產出。\n"
-            f"   👉 智慧判定為【銷文中途停止】，自動無縫接軌繼續推進銷文（不提前調用 AI 審查）！"
-        )
-        return PipelineState.NEED_GENERATE, {}
 
     # 5. 初稿已整體完成（已銷文至經末，覆蓋率 >= 95%）-> 進入全篇 AI 審查
     logger.info(
