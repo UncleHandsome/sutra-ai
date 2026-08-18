@@ -149,18 +149,15 @@ class ApiKeyPool:
         """深層穿透更新 OpenAI Client 實例的 API Key 與授權 Header"""
         if hasattr(client, "api_key"):
             client.api_key = key
-        # 同步更新自訂 Header 與 httpx 內部 Header
+        # 同步更新自訂 Header 與 httpx 內部 Header（避免大小寫重複設置導致 Cloudflare 400 Bad Request）
         if hasattr(client, "_custom_headers") and isinstance(client._custom_headers, dict):
             client._custom_headers["Authorization"] = f"Bearer {key}"
-            client._custom_headers["authorization"] = f"Bearer {key}"
-        # 兼容最新 OpenAI Python SDK 內部 Client 配置與 Auth 實例
+            client._custom_headers.pop("authorization", None)
+        # 兼容最新 OpenAI Python SDK 內部 Client 配置
         if hasattr(client, "_client"):
             try:
                 if hasattr(client._client, "headers"):
                     client._client.headers["Authorization"] = f"Bearer {key}"
-                    client._client.headers["authorization"] = f"Bearer {key}"
-                if hasattr(client._client, "_auth"):
-                    client._client._auth = None  # 強制 httpx 重新依據 headers 建立授權
             except Exception:
                 pass
         if hasattr(client, "_auth") and hasattr(client._auth, "token"):
@@ -737,6 +734,15 @@ def request_and_validate_segment(
             raise
         except Exception as e:
             err_msg = str(e)
+            # 模型不可用或已被下線（如 404 unavailable for free），直接中止，避免無效輪換金鑰
+            model_fatal_keywords = [
+                "unavailable for free", "use this slug instead", "model_not_found",
+                "does not exist", "no allowed providers are available"
+            ]
+            if any(kw in err_msg.lower() for kw in model_fatal_keywords):
+                logger.critical(f"❌ [模型不可用] 模型 '{model}' 無法使用 ({err_msg})！請使用 --model 指定其他可用模型。")
+                return None, None, True
+
             fatal_keywords = [
                 "insufficient balance", "creditserror", "authenticationerror",
                 "invalid_api_key", "401", "402", "payment required"
@@ -2369,6 +2375,15 @@ def ai_review(
             raise
         except Exception as e:
             err_msg = str(e)
+            # 模型不可用或已被下線（如 404 unavailable for free），直接中止，避免無效輪換金鑰
+            model_fatal_keywords = [
+                "unavailable for free", "use this slug instead", "model_not_found",
+                "does not exist", "no allowed providers are available"
+            ]
+            if any(kw in err_msg.lower() for kw in model_fatal_keywords):
+                logger.critical(f"❌ [模型不可用] 模型 '{model}' 無法使用 ({err_msg})！請使用 --model 指定其他可用模型。")
+                return None
+
             fatal_keywords = [
                 "insufficient balance", "creditserror", "authenticationerror",
                 "invalid_api_key", "401", "402", "payment required"
@@ -3473,12 +3488,12 @@ def auto_output_path(input_file: str) -> str:
 PROVIDER_DEFAULTS = {
     "deepseek": {
         "base_url": "https://api.deepseek.com",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-v4-flash",
         "name": "DeepSeek 官方 API",
     },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "default_model": "gemini-2.5-flash",
+        "default_model": "gemini-flash-latest",
         "name": "Google AI Studio",
     },
     "free_glm": {
@@ -3488,12 +3503,12 @@ PROVIDER_DEFAULTS = {
     },
     "opencode": {
         "base_url": "https://opencode.ai/zen/go/v1",
-        "default_model": "deepseek-v3.2",
+        "default_model": "deepseek-v4-flash",
         "name": "OpenCode Go 訂閱端點",
     },
     "zen": {
         "base_url": "https://opencode.ai/zen/v1",
-        "default_model": "deepseek-v3.2",
+        "default_model": "deepseek-v4-flash",
         "name": "OpenCode Zen 按量端點",
     },
 }
