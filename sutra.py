@@ -135,16 +135,26 @@ class ApiKeyPool:
         self.current_idx = (self.current_idx + 1) % len(self.active_keys)
         return self.active_keys[self.current_idx]
 
+    def _apply_key_to_client(self, client: Any, key: str) -> None:
+        """深層穿透更新 OpenAI Client 實例的 API Key 與授權 Header"""
+        if hasattr(client, "api_key"):
+            client.api_key = key
+        # 同步更新自訂 Header 與 httpx 內部 Header
+        if hasattr(client, "_custom_headers") and isinstance(client._custom_headers, dict):
+            client._custom_headers["Authorization"] = f"Bearer {key}"
+        # 兼容最新 OpenAI Python SDK 內部 Client 配置
+        if hasattr(client, "_client") and hasattr(client._client, "headers"):
+            try:
+                client._client.headers["Authorization"] = f"Bearer {key}"
+            except Exception:
+                pass
+
     def rotate_client(self, client: Any, logger: logging.Logger, reason: str = "觸發限制/異常") -> str:
         """切換下一把金鑰並同步更新 OpenAI Client"""
         if not self.active_keys:
             return ""
         new_key = self.rotate()
-        if hasattr(client, "api_key"):
-            client.api_key = new_key
-        # 兼容部分 SDK 版本的 internal auth header
-        if hasattr(client, "_custom_headers") and isinstance(client._custom_headers, dict):
-            client._custom_headers["Authorization"] = f"Bearer {new_key}"
+        self._apply_key_to_client(client, new_key)
         logger.warning(
             f"    🔑 [金鑰輪換] {reason}，已自動切換至可用 Key ({self.mask_key(new_key)})"
         )
@@ -168,11 +178,9 @@ class ApiKeyPool:
             logger.critical("    🚫 [警報] 金鑰池中所有 API Key 皆已全數耗盡或失效！")
             return True
 
-        # 自動切換到下一把存活的 Key
         self.current_idx = self.current_idx % len(self.active_keys)
         new_key = self.active_keys[self.current_idx]
-        if hasattr(client, "api_key"):
-            client.api_key = new_key
+        self._apply_key_to_client(client, new_key)
         logger.info(f"    ✨ 已無縫接軌切換至下一把正常 Key ({self.mask_key(new_key)})")
         return False
 
@@ -196,20 +204,29 @@ class ApiKeyPool:
 # ============================================================
 #  一、常數預編譯與古籍文字學映射
 # ============================================================
-RE_CLEAN_CJK = re.compile(r"[^\w\u4e00-\u9fa5]")
-RE_CLEAN_CHAR = re.compile(r"[\w\u4e00-\u9fa5]")
+# 擴充相容 CJK 擴展 A~G 區、相容字元與增補漢字，防止大藏經生僻字被誤過濾導致索引脫軌
+# 完整支援 CJK 基本區、相容區、擴展 A 區 (BMP) 及擴展 B~I 區 (SIP/TIP 超大字集)
+CJK_PATTERN_STR = r"\w\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ebbf"
+RE_CLEAN_CJK = re.compile(rf"[^{CJK_PATTERN_STR}]")
+RE_CLEAN_CHAR = re.compile(rf"[{CJK_PATTERN_STR}]")
 RE_THINK_TAG = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 RE_CODE_FENCE_OPEN = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*\n?", re.MULTILINE)
 RE_CODE_FENCE_CLOSE = re.compile(r"\n?\s*```\s*$", re.MULTILINE)
 
-# 統一古異體字至標準通行字（單向歸一化）
+# ★ 全域統一 Markdown 段落切分正則（支援 #、*、> 等前綴修飾與原典標籤）
+SECTION_SPLIT_REGEX = re.compile(
+    r"(?:\n\s*---\s*\n|(?<=\n)(?=(?:[\s#*`>]*【當前經文進度】|"
+    r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*)[\s*`>]*原典)))"
+)
+
+# 統一古異體字至標準通行字（單向歸一化，已剔除「雲/云」等詞義衝突字）
 VARIANT_CHAR_MAP = str.maketrans({
     "媅": "耽", "怱": "匆", "蘇": "酥", "妒": "妬",
     "睹": "覩", "麤": "粗", "麁": "粗", "併": "并",
     "回": "迴", "嗔": "瞋", "倶": "俱", "缽": "鉢",
-    "雲": "云", "凈": "淨", "净": "淨", "註": "注",
-    "沈": "沉", "祗": "祇", "袛": "祇", "衹": "祇",
-    "只": "祇", "裏": "裡", "墮": "堕", "辨": "辯", "鷄": "雞",
+    "凈": "淨", "净": "淨", "註": "注", "沈": "沉",
+    "祗": "祇", "袛": "祇", "衹": "祇", "只": "祇",
+    "裏": "裡", "墮": "堕", "辨": "辯", "鷄": "雞",
 })
 
 # 全域 API 請求時間戳（用於免費模型/Gemini 頻率限制控制）
@@ -361,7 +378,13 @@ def extract_sentence(raw_content: str) -> Optional[str]:
         return t
 
     # 增強版正則：相容 🔹 **原典：**、### 🔹 原典、🔹 原典： 等所有粗體冒號組合
-    primary_pat = r"(?:[\s#*`>]*🔹[\s*`>]*|【\s*🔹?\s*)原典(?:[\s*`>]*[：:]|[：:][\s*`>]*|】[：:]?)\s*([\s\S]*?)(?=(?:\n\s*🔸|\n\s*【|$))"
+    # 增強版正則：相容 **🔹 原典**：、🔹 **原典：**、🔹 原典（註）：、### 🔹 原典 等各種變體
+    primary_pat = (
+        r"(?:[\s#*`>]*🔹[\s*`>]*|【\s*🔹?\s*|\*{1,3}\s*🔹\s*)原典"
+        r"(?:[（\(][^）\)]*?[）\)])?"
+        r"(?:[\s*`>]*[：:]|[：:][\s*`>]*|】[：:]?|\*{1,3}[：:]?)"
+        r"\s*([\s\S]*?)(?=(?:\n\s*🔸|\n\s*【|\n\s*#|$))"
+    )
     m = re.search(primary_pat, raw_content)
     if m and m.group(1).strip():
         return _clean_s(m.group(1))
@@ -381,12 +404,12 @@ def extract_sentence(raw_content: str) -> Optional[str]:
 
 
 def is_ignorable_gap(gap_text: str) -> bool:
-    """判斷是否為純符號空白或經名品題（嚴格限定標題結構，防止誤殺『十地/見分/三品』等正文）"""
-    clean = RE_CLEAN_CJK.sub("", gap_text)
+    """判斷是否為純符號空白、經名品題或譯者署名（具備防誤殺保護）"""
+    clean = normalize_text(gap_text)
     if not clean:
         return True
 
-    # 嚴格品題結構：必須明確包含「品第X」、「第X卷/品/章/分」或「經卷X」
+    # 1. 嚴格品題與卷次結構
     strict_title_patterns = [
         r"^.*?[經論律]\s*(?:卷|品|章|分)(?:第[一二三四五六七八九十百千\d]+)?(?:之[一二三四五六七八九十\d初末餘之]+)?$",
         r"^.*?(?:品第|卷第|分第)[一二三四五六七八九十百千\d]+$",
@@ -394,21 +417,32 @@ def is_ignorable_gap(gap_text: str) -> bool:
         r"^.*?經卷(?:第?[一二三四五六七八九十百千\d]+)?$",
     ]
 
-    if len(clean) <= 30 and any(re.match(pat, clean) for pat in strict_title_patterns):
-        return True
+    # 2. 常見三藏譯師署名與經首序文題記
+    translator_patterns = [
+        r"^.*?(?:三藏法師|譯經三藏|沙門|法師|天竺三藏|臣|奉詔|詔譯|共譯|譯|奉敕譯)[\u4e00-\u9fff\w\s]*?(?:譯|製|序|說|筆受|集)$",
+        r"^.*?(?:御製|皇帝製|唐太宗|高宗|武后)[\u4e00-\u9fff\w\s]*?(?:序|讚|文|記)$",
+        r"^(?:開經偈|無上甚深微妙法|百千萬劫難遭遇|我今見聞得受持|願解如來真實義)$",
+    ]
+
+    if len(clean) <= 35:
+        if any(re.match(pat, clean) for pat in strict_title_patterns):
+            return True
+        if any(re.match(pat, clean) for pat in translator_patterns):
+            return True
+
     return False
 
 
 def validate_output_format(raw_content: str) -> Tuple[bool, List[str]]:
-    """驗證輸出格式是否包含全部必備結構（超強相容 Gemini / 各大模型之 Markdown 標題、粗體、清單與同義詞變體）"""
+    """驗證輸出格式是否包含全部必備結構（修復孤立 🔹 短路誤判，強化格式完整性校驗）"""
     required_sections = [
         (
             "🔹 原典",
-            r"🔹|原典\s*(?:\*\*)*[：:]|【\s*原典\s*】|#{1,4}\s*.*(?:原典|經文)|^[\s*`-]*\*{0,2}(?:原典|經文)\*{0,2}[：:]?"
+            r"(?:🔹\s*(?:\*\*)*\s*(?:原典|經文)|【\s*🔹?\s*(?:原典|經文)\s*】|#{1,4}\s*.*(?:原典|經文)|^[\s*`-]*\*{0,2}(?:原典|經文)\*{0,2}[：:])"
         ),
         (
             "🔸 釋詞",
-            r"🔸\s*(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞|名相)|(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*(?:\*\*)*[：:]?|【\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*】|#{1,4}\s*.*(?:釋詞|釋義|詞義|字詞|名相)|^[\s*`-]*\*{0,2}(?:釋詞|釋義|詞義|字詞解釋|名相解釋|名相釋義)\*{0,2}[：:]?"
+            r"(?:🔸\s*(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞|名相)|(?:\*\*|#)*\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*(?:\*\*)*[：:]?|【\s*(?:釋詞|釋義|詞義|字詞解釋|名相解釋|字句解釋)\s*】|#{1,4}\s*.*(?:釋詞|釋義|詞義|字詞|名相)|^[\s*`-]*\*{0,2}(?:釋詞|釋義|詞義|字詞解釋|名相解釋|名相釋義)\*{0,2}[：:])"
         ),
         (
             "🔸 銷文",
@@ -520,29 +554,31 @@ def request_and_validate_segment(
     logger: logging.Logger,
     loop_guard: int,
     is_gap_mode: bool,
-    guideline_title: str,
-    first_rule: str,
-    dup_guide: str
+    dup_guide: str = ""
 ) -> Tuple[Optional[str], Optional[str], bool]:
     """
     執行單次單元銷文請求、清洗與格式品質校驗
     （DeepSeek / OpenAI Prompt Cache 前綴極致鎖定版）
-    回傳: (success_block, extracted_sent, should_terminate)
     """
     retry_feedback = ""
     norm_rem_len = len(normalize_text(remaining_text))
 
-    # 1. 靜態指引規範區塊（結構與文字絕對固定，鎖定快取前綴）
-    guideline_parts = []
-    if guideline_title:
-        guideline_parts.append(guideline_title)
-    if first_rule:
-        guideline_parts.append(first_rule)
-    if dup_guide:
-        guideline_parts.append(dup_guide)
-    guideline_section = ("\n".join(guideline_parts) + "\n\n") if guideline_parts else ""
+    # 1. 區塊 A 絕對靜態規範（字元級固定，保證 100% 命中 KV Cache 前綴）
+    guideline_section = (
+        "【重寫與銷文核心準則】：\n"
+        "1. 原典嚴格從指定剩餘經文的第一字開始照抄，禁止省略號或跳字。\n"
+        "2. 五言/七言韻文必須以整偈（4句）為基礎單位，嚴禁輸出半偈或單句。\n"
+        "3. 散文若內部包含多個自足法相，請截取首個完整子單元銷文，後續經文系統自動推進；若屬長篇論證則由你自主裁量邊界。\n\n"
+    )
 
-    # 2. 義理導向動態切分指引（去除動態字數數字，避免 Token Jitter 破壞快取）
+    # 2. 區塊 B 動態任務引導（置於動態區域，不破壞區塊 A 快取）
+    dynamic_task_hint = ""
+    if is_gap_mode:
+        dynamic_task_hint = "💡【補漏任務指引】：當前為經文漏段補齊，請嚴格自指定起點切出首個自足單元推進。\n\n"
+    elif dup_guide:
+        dynamic_task_hint = f"💡【去重特別指引】：{dup_guide}\n\n"
+
+    # 義理導向動態切分指引
     split_hint = ""
     if problem_desc and any(kw in problem_desc for kw in ["拆分", "過長", "切分", "堆疊"]):
         split_hint = (
@@ -559,7 +595,6 @@ def request_and_validate_segment(
         )
 
     pool = getattr(client, "key_pool", None)
-    # 動態調整重試上限：多 Key 時確保每一把 Key 至少能輪流嘗試 2 遍
     max_retries = max(len(pool) * 2, 6) if (pool and pool.has_multiple()) else 3
 
     for retry in range(max_retries):
@@ -571,7 +606,8 @@ def request_and_validate_segment(
             # ─── 區塊 A：絕對靜態前綴（全本經文 + 核心規範，100% 鎖定 Cache） ───
             f"【經典全本文脈背景】：\n{sutra_text}\n\n"
             f"{guideline_section}"
-            # ─── 區塊 B：動態上下文（每輪前移推進） ───
+            # ─── 區塊 B：動態上下文（每輪前移推進，dynamic_task_hint 已正確接入） ───
+            f"{dynamic_task_hint}"
             f"{problem_section}"
             f"{split_hint}"
             f"【前文脈絡錨點】：\n{prev_sentence if prev_sentence else '（經文起始段落）'}\n\n"
@@ -716,9 +752,11 @@ def get_sutra_coverage(sutra_text: str, completed_sentences: List[str]) -> Tuple
 
     for orig_idx, s, s_norm in sorted_sentences:
         matches = [m.start() for m in re.finditer(re.escape(s_norm), norm_sutra)]
+        is_prefix_fallback = False
         if not matches and len(s_norm) >= 4:
             prefix = s_norm[: min(4, len(s_norm))]
             matches = [m.start() for m in re.finditer(re.escape(prefix), norm_sutra)]
+            is_prefix_fallback = True
 
         if not matches:
             continue
@@ -730,6 +768,13 @@ def get_sutra_coverage(sutra_text: str, completed_sentences: List[str]) -> Tuple
 
         for pos in matches:
             end_pos = min(pos + len(s_norm), n)
+            # ★ 若使用前綴降級匹配，必須核驗區間內的文字相似度，防止將數十個不相關字元誤塗黑
+            if is_prefix_fallback:
+                target_window = norm_sutra[pos:end_pos]
+                matching_chars = sum(1 for a, b in zip(s_norm, target_window) if a == b)
+                if len(s_norm) > 0 and (matching_chars / len(s_norm)) < 0.65:
+                    continue
+
             new_cover = sum(1 for i in range(pos, end_pos) if not covered_mask[i])
             dist = abs(pos - expected_pos)
             if new_cover > max_new_cover or (new_cover == max_new_cover and dist < best_distance):
@@ -775,10 +820,14 @@ def find_missing_gaps(sutra_text: str, completed_sentences: List[str]) -> List[S
             while gap_start_raw > 0 and sutra_text[gap_start_raw - 1] in open_brackets:
                 gap_start_raw -= 1
 
+            close_brackets = "」』”’）)]】〕>》〉"
             if gap_end_clean < len(clean_to_raw_map):
                 gap_end_raw = clean_to_raw_map[gap_end_clean]
                 while gap_end_raw > gap_start_raw and sutra_text[gap_end_raw - 1] in open_brackets:
                     gap_end_raw -= 1
+                # 向後包含緊密相連的閉合引號與標點，避免標點殘留
+                while gap_end_raw < len(sutra_text) and sutra_text[gap_end_raw] in close_brackets:
+                    gap_end_raw += 1
             else:
                 gap_end_raw = len(sutra_text)
 
@@ -951,8 +1000,22 @@ def find_best_position(raw_target: str, section_text: str, clean_sutra: str, nor
 # ============================================================
 #  五、Markdown 文件管理、安全原子寫入與物理重排
 # ============================================================
+def ensure_initial_backup(filepath: str) -> None:
+    """在任務開始前，永久保留一份未更動前的初始檔案備份 (.orig.bak)"""
+    if os.path.exists(filepath):
+        orig_bak = filepath + ".orig.bak"
+        if not os.path.exists(orig_bak):
+            try:
+                shutil.copy2(filepath, orig_bak)
+            except Exception:
+                pass
+
+
 def safe_write_file(filepath: str, content: str) -> None:
     """Windows / OneDrive 檔案鎖容錯強化版原子寫入（具備指數退避、緊急另存防丟失與強制同步）"""
+    # 確保初始原始檔備份存在
+    ensure_initial_backup(filepath)
+
     if os.path.exists(filepath):
         try:
             shutil.copy2(filepath, filepath + ".bak")
@@ -1056,34 +1119,27 @@ def parse_md_sections(filepath: str) -> Tuple[str, List[str]]:
         header = m.group(1)
         content = content[len(m.group(1)):]
 
-    # 支援前置 #、*、> 等各類 Markdown 修飾標籤的前瞻切分
-    split_pattern = (
-        r"(?:\n\s*---\s*\n|(?<=\n)(?=(?:[\s#*`>]*【當前經文進度】|"
-        r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*)[\s*`>]*原典)))"
-    )
+    # 統一使用全域切分正則
     raw_blocks = [
         s.strip()
-        for s in re.split(split_pattern, content)
+        for s in SECTION_SPLIT_REGEX.split(content)
         if s.strip() and s.strip() != "---"
     ]
     raw_sections = [b for b in raw_blocks if not (b.startswith("#") and "佛經銷文" in b and len(b) < 120)]
 
     sections = []
     for b in raw_sections:
-        # 清除開頭孤立符號
         b = re.sub(
             r'(🔹\s*(?:\*\*)*\s*原典\s*(?:\*\*)*[：:]\s*[「『"\'“]*)[）\)\]】〕＞》〉，。！？；、：\s]+',
             r'\1',
             b
         )
         if not sections:
-            # ★ 關鍵修復：在遇到第一個包含「🔹 原典」的有效區塊前，前置說明一律併入 header，防止索引錯位
             if extract_sentence(b):
                 sections.append(b)
             else:
                 header = (header.strip() + "\n\n" + b).strip() + "\n\n"
         else:
-            # 健全化黏合：若區塊不含原典，視為上一段落之延伸補充
             if not extract_sentence(b):
                 sections[-1] += "\n\n" + b
             else:
@@ -1104,15 +1160,12 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
         header = title_match.group(1).strip()
         content_body = content_body[len(title_match.group(1)):].strip()
 
-    # 徹底清除開頭可能殘留的獨立分隔線，防止段落解析異常
     content_body = re.sub(r"^(?:\s*---\s*\n*)+", "", content_body).strip()
 
+    # 統一使用全域切分正則
     raw_sections = [
         s.strip()
-        for s in re.split(
-            r"(?:\n\s*---\s*\n|(?<=\n)(?=(?:【當前經文進度】|【單句銷文】|🔹\s*(?:\*\*)*原典)))",
-            content_body
-        )
+        for s in SECTION_SPLIT_REGEX.split(content_body)
         if s.strip() and s.strip() != "---"
     ]
 
@@ -1160,8 +1213,10 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
             matches = [m.start() for m in re.finditer(re.escape(prefix), norm_sutra)]
 
         if not matches:
+            # ★ 修復：依原始段落索引在全文中的相對位置進行線性插值，避免被丟到檔案末尾
+            estimated_pos = int((item.get("orig_idx", 0) / max(1, len(section_items))) * n)
             assigned_sections.append({
-                "pos": 9999999,
+                "pos": estimated_pos,
                 "orig_idx": item.get("orig_idx", 0),
                 "sec": item.get("sec", ""),
                 "norm_s": norm_s,
@@ -1232,8 +1287,9 @@ def update_md_file(
     segments_snapshot: List[str],
     logger: logging.Logger
 ) -> None:
-    """將修正結果寫回 MD 檔，並進行經文位置物理校準重排"""
+    """將修正結果寫回 MD 檔，並進行經文位置物理校準重排（具備文字特徵動態錨定機制）"""
     header, sections = parse_md_sections(filepath)
+    # 由後往前替換，降低前方索引變動影響
     corrections.sort(key=lambda x: x[1][0] if (x[1] and len(x[1]) > 0) else -1, reverse=True)
 
     for new_content, merge_idx in corrections:
@@ -1245,20 +1301,58 @@ def update_md_file(
             if 0 <= orig_i < len(segments_snapshot):
                 target_seg = segments_snapshot[orig_i]
                 norm_target = normalize_text(target_seg)
+                if not norm_target:
+                    continue
 
-                search_window = sorted(
-                    range(max(0, orig_i - 5), min(len(sections), orig_i + 6)),
-                    key=lambda idx: abs(idx - orig_i)
-                )
-                matched = False
-                for sec_idx in search_window:
-                    sec_orig_sent = extract_sentence(sections[sec_idx])
-                    sec_orig_norm = normalize_text(sec_orig_sent) if sec_orig_sent else ""
-                    if norm_target and sec_orig_norm and (norm_target in sec_orig_norm or sec_orig_norm in norm_target):
-                        if sec_idx not in target_indices_in_sections:
-                            target_indices_in_sections.append(sec_idx)
-                        matched = True
+                # 優先全域特徵比對，避免依賴易位移的局部搜尋窗口
+                best_sec_idx = -1
+                best_match_score = -1
+                for sec_idx, sec_text in enumerate(sections):
+                    sec_sent = extract_sentence(sec_text)
+                    sec_norm = normalize_text(sec_sent) if sec_sent else ""
+                    if not sec_norm:
+                        continue
+
+                    # 精確匹配或高度包含判定
+                    if norm_target == sec_norm:
+                        best_sec_idx = sec_idx
                         break
+                    elif norm_target in sec_norm or sec_norm in norm_target:
+                        overlap = min(len(norm_target), len(sec_norm))
+                        if overlap > best_match_score:
+                            best_match_score = overlap
+                            best_sec_idx = sec_idx
+
+                if best_sec_idx != -1 and best_sec_idx not in target_indices_in_sections:
+                    target_indices_in_sections.append(best_sec_idx)
+
+        # 若特徵比對未果，安全回退至索引保底
+        if not target_indices_in_sections:
+            target_indices_in_sections = [i for i in merge_idx if 0 <= i < len(sections)]
+
+        target_indices_in_sections.sort()
+
+        if target_indices_in_sections:
+            first_pos = target_indices_in_sections[0]
+            # 由後往前刪除舊區塊
+            for idx in reversed(target_indices_in_sections):
+                if 0 <= idx < len(sections):
+                    sections.pop(idx)
+
+            # 插入重寫後的新區塊
+            if new_content and new_content != "<!-- DELETE -->":
+                new_blocks = [
+                    b.strip()
+                    for b in SECTION_SPLIT_REGEX.split(new_content)
+                    if b.strip() and b.strip() != "<!-- DELETE -->"
+                ]
+                for offset, block in enumerate(new_blocks):
+                    sections.insert(first_pos + offset, block)
+
+    combined_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(sections)
+    reordered_content = reorder_markdown_by_sutra(combined_body, sutra_text)
+    safe_write_file(filepath, reordered_content)
+    logger.info(f"✨ MD 檔案已安全更新（已備份 .bak）並依原典物理位置重排：{filepath}")
 
                 if not matched:
                     sorted_sec_indices = sorted(range(len(sections)), key=lambda idx: abs(idx - orig_i))
@@ -1366,7 +1460,6 @@ def stream_completion(
             wait_seconds = target_interval - elapsed
             logger.info(f"  ⏳ [頻率管控] API 調用間隔保護中，等待 {wait_seconds:.1f} 秒...")
             time.sleep(wait_seconds)
-        _LAST_API_CALL_TIME = time.time()
 
     create_kwargs = {
         "model": model,
@@ -1438,6 +1531,15 @@ def stream_completion(
     target_usage_source = captured_usage if captured_usage is not None else last_chunk
     if target_usage_source:
         log_cache_metrics(logger, target_usage_source, action_name=action_name)
+
+    # 檢查是否因 token 上限遭遇長度截斷
+    if last_chunk and hasattr(last_chunk, "choices") and last_chunk.choices:
+        finish_reason = getattr(last_chunk.choices[0], "finish_reason", None)
+        if finish_reason == "length":
+            logger.warning("  ⚠️ [輸出截斷警告] 模型輸出觸及 max_tokens 上限，內容可能不完整！")
+
+    # 確保以請求結束的時間點作為頻率間隔起算點
+    _LAST_API_CALL_TIME = time.time()
 
     full_output = "".join(content_parts)
     if getattr(client, "debug_mode", False):
@@ -1559,21 +1661,16 @@ def generate_sutra_segments(
     dup_guide = ""
     if "重複" in issue_type:
         dup_guide = (
-            "4. 【重複內容特別指引】：若前文已包含部分重複經文，請僅針對指定的剩餘經文進行銷文；"
+            "若前文已包含部分重複經文，請僅針對指定的剩餘經文進行銷文；"
             "若本段經文已完全重複，請直接輸出 <!-- DELETE -->。"
         )
 
     is_gap_mode = ("經文漏段補齊" in issue_type or "補漏" in issue_type or "全本經文銷文" in issue_type)
-    guideline_title = "【補漏指引與核心規範】" if is_gap_mode else "【修復通用指引與核心規範】"
-    first_rule = (
-        "1. 這是一段先前遺漏或待推進的經文，若經文較長，請僅切分出當前第一個語意自足的獨立單元（約 20～50 字）進行銷文，切勿一次全吞。"
-        if is_gap_mode
-        else "1. 請切出當前第一個語意自足的獨立單元（約 20～50 字）進行銷文，並符合所有銷文結構規範。"
-    )
 
     while remaining_text and len(normalize_text(remaining_text)) > 0 and loop_guard < max_loops:
         loop_guard += 1
 
+        # 簡化呼叫簽名，移除冗餘參數
         success_block, extracted_sent, should_term = request_and_validate_segment(
             client=client,
             model=model,
@@ -1586,8 +1683,6 @@ def generate_sutra_segments(
             logger=logger,
             loop_guard=loop_guard,
             is_gap_mode=is_gap_mode,
-            guideline_title=guideline_title,
-            first_rule=first_rule,
             dup_guide=dup_guide
         )
 
@@ -2289,8 +2384,13 @@ def merge_overlapping_issues(
                 prev["issue_type"] = f"{prev['issue_type']}+{cur['issue_type']}"
             if cur["problem"] and cur["problem"] not in prev["problem"]:
                 prev["problem"] = f"{prev['problem']}；{cur['problem']}"
-            if not prev["gap_text"] and cur["gap_text"]:
-                prev["gap_text"] = cur["gap_text"]
+            # ★ 修復：若兩者皆有漏段文字，必須安全串接，絕不可靜默丟棄後者
+            if cur["gap_text"]:
+                if prev["gap_text"]:
+                    if cur["gap_text"] not in prev["gap_text"]:
+                        prev["gap_text"] = f"{prev['gap_text']} {cur['gap_text']}".strip()
+                else:
+                    prev["gap_text"] = cur["gap_text"]
             if not prev["position"] and cur["position"]:
                 prev["position"] = cur["position"]
         else:
@@ -2378,47 +2478,37 @@ def run_fill_gaps(
     mode_title: str = "經文補漏 (Gap Fill)",
     issue_type: str = "經文漏段補齊"
 ) -> None:
-    """★ 統一經文推進引擎（數學本質：從零銷文 ≡ 遺漏率 100% 的補漏）"""
     logger.info("=" * 65)
     logger.info(f"🚀 啟動 {mode_title} 模式：{output_path}")
     logger.info("=" * 65)
 
-    # 預先校準已存在的 MD 結構
-    if os.path.exists(output_path):
-        header, sections = parse_md_sections(output_path)
-        if sections:
-            cur_body = (header + "\n\n---\n\n" if header else "") + "\n\n---\n\n".join(sections)
-            reordered = reorder_markdown_by_sutra(cur_body, sutra_text)
-            safe_write_file(output_path, reordered)
-
-    existing_segments = extract_segments_from_md(output_path) if os.path.exists(output_path) else []
-    missing_gaps = find_missing_gaps(sutra_text, existing_segments)
-
-    if not missing_gaps:
-        logger.info("✅ 經文覆蓋率已達 100%，全文皆已銷文完畢，無須重複生成！")
-        return
-
-    total_gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in missing_gaps)
-    logger.info(f"📖 待處理經文共 {len(missing_gaps)} 個區間（總計 {total_gap_chars} 字），開始逐段推進...")
-    total_added_blocks = 0
-
-    # 讀取或建立初始 MD 結構，避免每個區塊都重新讀寫檔案
-    if os.path.exists(output_path):
-        header, cur_sections = parse_md_sections(output_path)
-    else:
-        cur_sections = []
+    if not os.path.exists(output_path):
         base_name = os.path.splitext(os.path.basename(output_path))[0].replace("_銷文", "")
-        header = f"# 佛經銷文：{base_name}\n\n"
+        safe_write_file(output_path, f"# 佛經銷文：{base_name}\n\n")
 
-    for gap_i, g in enumerate(missing_gaps, 1):
+    total_added_blocks = 0
+    clean_sutra_len = len(normalize_text(sutra_text))
+
+    while True:
+        # 每一輪推進前，重新讀取、物理重排並重新計算即時遮罩
+        header, cur_sections = parse_md_sections(output_path)
+        existing_segments = extract_segments_from_md(output_path)
+        missing_gaps = find_missing_gaps(sutra_text, existing_segments)
+
+        if not missing_gaps:
+            logger.info("✅ 經文覆蓋率已達 100%，全文皆已銷文完畢！")
+            break
+
+        # 每次僅取第一個 Gap 進行推進
+        g = missing_gaps[0]
         gap_raw = getattr(g, "gap_text", "").strip()
         p_idx = getattr(g, "prev_idx", -1)
         prev_sentence = existing_segments[p_idx] if (existing_segments and 0 <= p_idx < len(existing_segments)) else ""
 
-        logger.info(f"\n[{gap_i}/{len(missing_gaps)}] 正在推進銷文（長度 {len(normalize_text(gap_raw))} 字）：『{gap_raw[:30]}...』")
-        initial_section_count = len(cur_sections)
-        new_blocks_in_gap = []
+        gap_chars_len = len(normalize_text(gap_raw))
+        logger.info(f"\n📖 正在推進漏段（長度 {gap_chars_len} 字）：『{gap_raw[:30]}...』")
 
+        new_blocks_in_gap = []
         def block_success_handler(block_content: str, sent: str):
             nonlocal total_added_blocks, prev_sentence
             total_added_blocks += 1
@@ -2438,26 +2528,19 @@ def run_fill_gaps(
             on_block_success=block_success_handler
         )
 
-        # 批次安全寫入：當該 Gap 有新產出時，統一重排並寫入磁碟，同時同步更新記憶體中的段落
         if new_blocks_in_gap:
             cur_sections.extend(new_blocks_in_gap)
             combined_body = (header.strip() + "\n\n---\n\n" if header.strip() else "") + "\n\n---\n\n".join(cur_sections)
             reordered_md = reorder_markdown_by_sutra(combined_body, sutra_text)
             safe_write_file(output_path, reordered_md)
-            # 重新解析磁碟內容，保證記憶體 cur_sections 與磁碟物理重排 100% 同步
-            header, cur_sections = parse_md_sections(output_path)
 
         if not blocks or (rem_after and len(normalize_text(rem_after)) > 2):
             logger.error(f"  ❌ 經文推進於『{gap_raw[:20]}...』處中斷。")
             break
 
-        # 即時更新段落快照，確保下一漏段獲取最新的前文脈絡錨點（已去重）
-        existing_segments = extract_segments_from_md(output_path)
-
-    # 計算最終覆蓋率指標
+    # 計算最終成果報表
     latest_segments = extract_segments_from_md(output_path)
     final_gaps = find_missing_gaps(sutra_text, latest_segments)
-    clean_sutra_len = len(normalize_text(sutra_text))
     total_gaps_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in final_gaps)
     covered_chars = max(0, clean_sutra_len - total_gaps_chars)
     coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
@@ -2465,15 +2548,7 @@ def run_fill_gaps(
     logger.info("\n" + "=" * 65)
     logger.info(f"🎉 {mode_title} 執行完畢！本次共產出/補齊 {total_added_blocks} 個段落。")
     logger.info(f"📊 經文總覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
-    if final_gaps:
-        logger.warning(f"⚠️ 尚有 {len(final_gaps)} 處未完成區段：")
-        for idx, g in enumerate(final_gaps, 1):
-            gap_txt = getattr(g, "gap_text", "")
-            logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(gap_txt))} 字 | 預覽: 『{gap_txt[:40]}...』")
-    else:
-        logger.info("🎉 經文已 100% 銷文完畢，全文完整無缺！")
     logger.info("=" * 65)
-
 
 def run_generate(
     args: argparse.Namespace,
@@ -2729,84 +2804,6 @@ def run_fix(
         logger.info("=" * 65)
     return True
 
-
-def run_auto(
-    args: argparse.Namespace,
-    client: OpenAI,
-    model: str,
-    sutra_text: str,
-    segments: List[str],
-    style: str,
-    output_path: str,
-    logger: logging.Logger
-) -> None:
-    """★ 一鍵全流程模式（審查 -> 修正 -> 重排 -> 覆蓋率統計）"""
-    logger.info("=" * 65)
-    logger.info(f"★ 啟動一鍵全自動模式（經文風格：{'古典全句號文本' if style == 'ALL_PERIOD' else '現代新標點文本'}）")
-    logger.info("=" * 65)
-
-    review_path = os.path.splitext(output_path)[0] + "_review.json"
-    all_issues = None
-
-    if os.path.exists(review_path):
-        try:
-            with open(review_path, "r", encoding="utf-8") as f:
-                cached_issues = json.load(f)
-            max_idx = max(
-                [max(iss.get("merge_indices") or [iss.get("index", 0)]) for iss in cached_issues]
-            ) if cached_issues else -1
-            if max_idx < len(segments):
-                all_issues = cached_issues
-                logger.info(f"📋 檢測到有效審查報告：{review_path}")
-                logger.info(f"⚡ 索引校驗通過（共 {len(segments)} 段），載入報告中 {len(all_issues)} 處問題進行修正...")
-            else:
-                logger.warning(
-                    f"⚠️ 既有審查報告索引已過期（報告最大索引 {max_idx} >= 當前段落數 {len(segments)}），重新審查..."
-                )
-                all_issues = None
-        except Exception as e:
-            logger.warning(f"⚠️ 讀取既有審查報告失敗 ({e})，重新執行審查流程...")
-            all_issues = None
-
-    if all_issues is None:
-        all_issues = run_review(args, client, model, sutra_text, segments, style, output_path, logger)
-        if all_issues is None:
-            logger.error("❌ 審查中斷，停止流程。")
-            return
-
-    if not all_issues:
-        logger.info("\n✅ 審查結果良好，未發現需要修正的段落。")
-        return
-
-    fix_success = run_fix(args, client, model, sutra_text, segments, output_path, logger, all_issues=all_issues)
-    if not fix_success or args.dry_run:
-        return
-
-    logger.info("\n" + "=" * 65)
-    logger.info("🎉 一鍵全自動模式執行完畢，所有檢出問題已處理完畢！")
-    logger.info(f"最終輸出檔案：{output_path}")
-    logger.info("=" * 65)
-
-    latest_segments = extract_segments_from_md(output_path)
-    remaining_gaps = find_missing_gaps(sutra_text, latest_segments)
-
-    clean_sutra_len = len(normalize_text(sutra_text))
-    total_gaps_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in remaining_gaps)
-    covered_chars = max(0, clean_sutra_len - total_gaps_chars)
-    coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
-
-    logger.info("\n" + "=" * 65)
-    logger.info(f"📊 最終經文覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
-    if remaining_gaps:
-        logger.warning(f"⚠️ 尚有 {len(remaining_gaps)} 處未銷文漏段：")
-        for idx, g in enumerate(remaining_gaps, 1):
-            gap_txt = getattr(g, "gap_text", "")
-            logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(gap_txt))} 字 | 預覽: 『{gap_txt[:40]}...』")
-    else:
-        logger.info("🎉 經文已 100% 銷文完畢，無任何遺漏與割裂！")
-    logger.info("=" * 65)
-
-
 # ============================================================
 #  十、智慧狀態機與全自動流水線控制器
 # ============================================================
@@ -2847,18 +2844,22 @@ def detect_current_state(
     checkpoint_path = os.path.splitext(output_path)[0] + "_checkpoint.json"
     review_path = os.path.splitext(output_path)[0] + "_review.json"
 
-    # 1. 優先檢查是否有修復到一半的 Checkpoint 暫存檔
-    if os.path.exists(checkpoint_path) and os.path.exists(review_path):
+    # 1. 優先檢查是否有修復到一半的 Checkpoint 暫存檔（具備孤立容錯）
+    if os.path.exists(checkpoint_path):
         cached = load_checkpoint(checkpoint_path)
         if cached:
-            logger.info("🔍 [狀態感知] 發現中斷的修復暫存檔 (Checkpoint)，優先接續修復！")
             cached_issues = None
-            try:
-                with open(review_path, "r", encoding="utf-8") as rf:
-                    cached_issues = json.load(rf)
-            except Exception:
-                pass
+            if os.path.exists(review_path):
+                try:
+                    with open(review_path, "r", encoding="utf-8") as rf:
+                        cached_issues = json.load(rf)
+                except Exception:
+                    cached_issues = None
+            logger.info("🔍 [狀態感知] 發現中斷的修復暫存檔 (Checkpoint)，優先接續修復！")
             return PipelineState.NEED_CHECKPOINT_FIX, {"checkpoint_path": checkpoint_path, "issues": cached_issues}
+        else:
+            # 檔案損壞或空內容，自動安全清除
+            remove_checkpoint(checkpoint_path)
 
     # 2. 檢查 MD 銷文檔是否存在
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
@@ -2918,51 +2919,36 @@ def run_pipeline(
     sutra_text: str,
     style: str,
     output_path: str,
-    logger: logging.Logger
+    logger: logging.Logger,
+    max_review_cycles: int = 2
 ) -> bool:
-    """
-    【閉環智慧流水線（先審查後修補）】
-    全本銷文 (Generate) -> AI 深度審查與全域預檢 (AI Review) -> 依報告修復與補漏 (Review & Gap Fix) -> 終局安全補漏 (Safety Gap Fill)
-    回傳: True 表示 100% 完工且審查通過；False 表示中途遭遇錯誤或停滯中斷。
-    """
     logger.info("=" * 68)
     logger.info("🌟 啟動佛經銷文智慧閉環流水線（先審查後修復版）")
     logger.info(f"   經文檔案：{args.file}")
     logger.info(f"   輸出檔案：{output_path}")
     logger.info("=" * 68)
 
-    last_state = None
-    last_covered_chars = -1
-    stall_count = 0
+    review_cycle_count = 0
+    max_cycles = getattr(args, "max_review_cycles", max_review_cycles)
 
     while True:
-        # ★ 快速熔斷檢查：若所有 API Key 已全數失效，立即安全退出流水線
         if getattr(client, "key_pool", None) and client.key_pool.is_all_dead():
             logger.error("🛑 檢測到所有 API Key 皆已失效，流水線立即中止！")
             return False
 
         state, meta = detect_current_state(sutra_text, output_path, logger)
 
-        cur_segs = extract_segments_from_md(output_path) if os.path.exists(output_path) else []
-        cur_gaps = find_missing_gaps(sutra_text, cur_segs)
-        clean_total_len = len(normalize_text(sutra_text))
-        cur_covered = clean_total_len - sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in cur_gaps)
-
-        # 雙重狀態停滯檢測：相同狀態且無字數進展
-        if state == last_state and cur_covered == last_covered_chars and state != PipelineState.COMPLETED:
-            stall_count += 1
-            if stall_count >= 2:
-                logger.error(f"\n❌ [防死鎖警報] 流水線在【{state.value}】階段連續 2 輪未產生字數進展（停滯於 {cur_covered}/{clean_total_len} 字），安全中止。")
-                logger.warning(f"👉 請檢查日誌確認 API 餘額與回應狀態，或手動檢視：{output_path}")
-                return False
-        else:
-            stall_count = 0
-
-        last_state = state
-        last_covered_chars = cur_covered
+        # ★ 防死循環保護：若審查與修復反覆震盪超過上限，強制進入終局補漏核驗
+        if state == PipelineState.NEED_AI_REVIEW:
+            review_cycle_count += 1
+            if review_cycle_count > max_cycles:
+                logger.warning(
+                    f"⚠️ [保護機制] AI 審查已達最大循環次數 ({max_cycles} 輪)，"
+                    f"跳過後續細節挑刺，進入終局補漏核驗。"
+                )
+                state = PipelineState.NEED_GAP_FILL
 
         if state == PipelineState.COMPLETED:
-            # 完工時將審查報告保存為空陣列 []，使日後再次掃描時能瞬間識別「0 瑕疵已完工」，避免浪費 API
             review_path = os.path.splitext(output_path)[0] + "_review.json"
             try:
                 with open(review_path, "w", encoding="utf-8") as f:
@@ -2980,7 +2966,7 @@ def run_pipeline(
             run_generate(args, client, model, sutra_text, output_path, logger)
 
         elif state == PipelineState.NEED_AI_REVIEW:
-            logger.info("\n🧐 === [Stage 2/3] 直接執行 AI 深度邏輯審查與全域漏段預檢 ===")
+            logger.info(f"\n🧐 === [Stage 2/3] 執行 AI 深度邏輯審查 (第 {review_cycle_count}/{max_cycles} 輪) ===")
             segments = extract_segments_from_md(output_path)
             issues = run_review(args, client, model, sutra_text, segments, style, output_path, logger)
             if issues is None:
@@ -2989,12 +2975,15 @@ def run_pipeline(
             if not issues:
                 logger.info("✨ 經審查無任何語意割裂且無漏段，品質極佳！")
                 review_path = os.path.splitext(output_path)[0] + "_review.json"
-                with open(review_path, "w", encoding="utf-8") as f:
-                    json.dump([], f)
+                try:
+                    with open(review_path, "w", encoding="utf-8") as f:
+                        json.dump([], f)
+                except Exception:
+                    pass
                 continue
 
         elif state in (PipelineState.NEED_REVIEW_FIX, PipelineState.NEED_CHECKPOINT_FIX):
-            logger.info("\n🔧 === [Stage 3/3] 依審查報告執行段落合併、瑕疵重寫與漏段補齊 ===")
+            logger.info("\n🔧 === [Stage 3/3] 依審查報告執行修復與段落校準 ===")
             segments = extract_segments_from_md(output_path)
             issues_to_fix = meta.get("issues")
             if issues_to_fix:
@@ -3015,7 +3004,6 @@ def run_pipeline(
             logger.info("\n🔍 === [終局安全核驗] 執行微小縫隙安全補漏 ===")
             latest_segs = extract_segments_from_md(output_path)
             run_fix_gaps(args, client, model, sutra_text, latest_segs, style, output_path, logger)
-
 
 def find_sutra_md_pairs(root_dir: str, logger: Optional[logging.Logger] = None) -> List[Tuple[str, str]]:
     """遞迴搜尋目錄下所有 *_銷文.md 並自動匹配對應的 .txt 原始經文檔（含孤兒檔案診斷）"""
@@ -3103,14 +3091,29 @@ def run_batch(
         args.output = md_path
 
         try:
-            # 執行單檔智慧閉環流水線
-            is_ok = run_pipeline(args, client, model, sutra_text, style, md_path, file_logger)
+            segments = extract_segments_from_md(md_path)
+            is_ok = True
+
+            # 依據命令列參數進行多模式動態路由
+            if args.generate:
+                run_generate(args, client, model, sutra_text, md_path, file_logger)
+            elif args.fix_gaps:
+                run_fix_gaps(args, client, model, sutra_text, segments, style, md_path, file_logger)
+            elif args.review:
+                issues = run_review(args, client, model, sutra_text, segments, style, md_path, file_logger)
+                is_ok = (issues is not None)
+            elif args.fix or args.dry_run:
+                is_ok = run_fix(args, client, model, sutra_text, segments, md_path, file_logger)
+            else:
+                # 預設：全流程自動流水線
+                is_ok = run_pipeline(args, client, model, sutra_text, style, md_path, file_logger)
+
             if is_ok:
                 success_files.append(md_path)
-                logger.info(f"✨ [批次進度 {idx}/{total_files}] 檔案校對圓滿完成 (100% 覆蓋 + 0 瑕疵)：{md_name}")
+                logger.info(f"✨ [批次進度 {idx}/{total_files}] 檔案處理完成：{md_name}")
             else:
-                failed_files.append((md_path, "流水線中途停滯或 API 異常中斷"))
-                logger.warning(f"⚠️ [批次進度 {idx}/{total_files}] 檔案未完全完工，已安全保存進度：{md_name}")
+                failed_files.append((md_path, "處理中途停滯或 API 異常中斷"))
+                logger.warning(f"⚠️ [批次進度 {idx}/{total_files}] 檔案未完全完工：{md_name}")
         except KeyboardInterrupt:
             logger.warning("\n🛑 接收到使用者中斷信號 (Ctrl+C)，立即保存進度並退出批次任務。")
             raise
@@ -3173,17 +3176,18 @@ def load_api_keys(
     if api_key_str and api_key_str.strip():
         keys.extend(_parse_keys(api_key_str))
 
+    # 環境變數查找映射
     if not keys:
         if is_gemini:
-            env_vars = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
+            env_candidates = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
         elif is_free_glm:
-            env_vars = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
+            env_candidates = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
         elif is_opencode:
-            env_vars = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
+            env_candidates = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
         else:
-            env_vars = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+            env_candidates = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
 
-        for var in env_vars:
+        for var in env_candidates:
             val = os.environ.get(var)
             if val and val.strip():
                 parsed = _parse_keys(val)
@@ -3191,68 +3195,37 @@ def load_api_keys(
                     keys.extend(parsed)
                     break
 
+    # 本地金鑰檔案查找映射
     if not keys:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        candidate_files = []
-        if key_file:
-            candidate_files.append(key_file)
+        file_map = {
+            "gemini": ["gemini_key.txt", "google_key.txt", "gemini_api_key.txt", "api_key.txt"],
+            "free_glm": ["openrouter_key.txt", "openrouter_api_key.txt", "glm_key.txt", "api_key.txt"],
+            "opencode": ["opencode_key.txt", "opencode_api_key.txt", "api_key.txt"],
+            "deepseek": ["api_key.txt", "deepseek_key.txt", "deepseek_api_key.txt", "key.txt"],
+        }
+        category = "gemini" if is_gemini else ("free_glm" if is_free_glm else ("opencode" if is_opencode else "deepseek"))
+        candidate_filenames = file_map[category]
 
-        if is_gemini:
-            candidate_files.extend([
-                os.path.join(base_dir, "gemini_key.txt"),
-                os.path.join(base_dir, "google_key.txt"),
-                os.path.join(base_dir, "gemini_api_key.txt"),
-                os.path.join(base_dir, "api_key.txt"),
-            ])
-        elif is_free_glm:
-            candidate_files.extend([
-                os.path.join(base_dir, "openrouter_key.txt"),
-                os.path.join(base_dir, "openrouter_api_key.txt"),
-                os.path.join(base_dir, "glm_key.txt"),
-                os.path.join(base_dir, "api_key.txt"),
-            ])
-        elif is_opencode:
-            candidate_files.extend([
-                os.path.join(base_dir, "opencode_key.txt"),
-                os.path.join(base_dir, "opencode_api_key.txt"),
-                os.path.join(base_dir, "api_key.txt"),
-            ])
-        else:
-            candidate_files.extend([
-                os.path.join(base_dir, "api_key.txt"),
-                os.path.join(base_dir, "deepseek_key.txt"),
-                os.path.join(base_dir, "deepseek_api_key.txt"),
-                os.path.join(base_dir, "key.txt"),
-            ])
+        candidate_paths = [key_file] if key_file else []
+        candidate_paths.extend([os.path.join(base_dir, fname) for fname in candidate_filenames])
 
-        for kf in candidate_files:
-            if os.path.exists(kf):
-                with open(kf, "r", encoding="utf-8") as f:
-                    content = f.read()
-                parsed = _parse_keys(content)
-                if parsed:
-                    keys.extend(parsed)
-                    break
+        for kf in candidate_paths:
+            if kf and os.path.exists(kf):
+                try:
+                    with open(kf, "r", encoding="utf-8") as f:
+                        parsed = _parse_keys(f.read())
+                    if parsed:
+                        keys.extend(parsed)
+                        break
+                except Exception:
+                    pass
 
     if not keys:
-        if is_gemini:
-            target_name = "gemini_key.txt (或 google_key.txt / api_key.txt)"
-            env_hint = "GEMINI_API_KEY / GOOGLE_API_KEY"
-        elif is_free_glm:
-            target_name = "openrouter_key.txt (或 glm_key.txt / api_key.txt)"
-            env_hint = "OPENROUTER_API_KEY / OPENAI_API_KEY"
-        elif is_opencode:
-            target_name = "opencode_key.txt (或 api_key.txt)"
-            env_hint = "OPENCODE_API_KEY / OPENAI_API_KEY"
-        else:
-            target_name = "api_key.txt"
-            env_hint = "DEEPSEEK_API_KEY / OPENAI_API_KEY"
-
-        print(f"❌ 找不到金鑰檔案或內容為空，請建立 {target_name} 或設定環境變數 ({env_hint})")
+        print("❌ 找不到 API 金鑰，請建立對應金鑰檔案或設定環境變數！")
         return None
 
     return ApiKeyPool(keys)
-
 
 def auto_output_path(input_file: str) -> str:
     """自動推導 MD 檔路徑"""
@@ -3262,8 +3235,36 @@ def auto_output_path(input_file: str) -> str:
     return os.path.join(input_dir, f"{input_name}_銷文.md")
 
 
+PROVIDER_DEFAULTS = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+        "name": "DeepSeek 官方 API",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-2.5-flash",
+        "name": "Google AI Studio",
+    },
+    "free_glm": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "z-ai/glm-5.2:free",
+        "name": "OpenRouter Free GLM",
+    },
+    "opencode": {
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "default_model": "deepseek-v3.2",
+        "name": "OpenCode Go 訂閱端點",
+    },
+    "zen": {
+        "base_url": "https://opencode.ai/zen/v1",
+        "default_model": "deepseek-v3.2",
+        "name": "OpenCode Zen 按量端點",
+    },
+}
+
+
 def main():
-    # ★ Windows 控制台 UTF-8 編碼安全防禦
     if sys.platform == "win32":
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -3272,7 +3273,7 @@ def main():
             pass
 
     parser = argparse.ArgumentParser(
-        description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（智慧閉環流水線版）"
+        description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（智慧流水線版）"
     )
     parser.add_argument("--file", type=str, default=None, help="原始經文 txt 檔案路徑（單檔模式）")
     parser.add_argument("--recursive", "--batch-dir", "--batch", type=str, nargs="?", const=".", default=None, help="★ 遞迴批次模式：指定搜尋目錄（預設當前目錄 .），自動找出所有 *_銷文.md 逐一校驗修正完工")
@@ -3286,16 +3287,23 @@ def main():
     mode_group.add_argument("--review", action="store_true", help="手動指定：僅執行 AI 審查並輸出 review.json")
     mode_group.add_argument("--fix", action="store_true", help="手動指定：僅讀取 review.json 執行修正")
 
+    # 提供商互斥群組
+    provider_group = parser.add_mutually_exclusive_group()
+    provider_group.add_argument("--deepseek", action="store_const", dest="provider", const="deepseek", help="使用 DeepSeek 官方 API")
+    provider_group.add_argument("--gemini", "--google", action="store_const", dest="provider", const="gemini", help="★ 使用 Google AI Studio Gemini 免費端點")
+    provider_group.add_argument("--free-glm", "--glm5", "--glm", action="store_const", dest="provider", const="free_glm", help="★ 使用 OpenRouter Free GLM 免費模型端點")
+    provider_group.add_argument("--opencode", "--go", action="store_const", dest="provider", const="opencode", help="★ 使用 OpenCode Go 訂閱端點")
+    provider_group.add_argument("--zen", action="store_const", dest="provider", const="zen", help="使用 OpenCode Zen 按量計費端點")
+    parser.set_defaults(provider="deepseek")
+
     parser.add_argument("--dry-run", action="store_true", help="預覽待修清單，不呼叫 API 且不更動檔案（配合 --fix 使用）")
-    parser.add_argument("--debug", action="store_true", help="★ 開啟除錯輸出，即時印出 Gemini 每一次產出的完整原始內容 (Raw Output)")
-    parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="呼叫模型名稱")
+    parser.add_argument("--debug", action="store_true", help="★ 開啟除錯輸出，即時印出每一次產出的完整原始內容 (Raw Output)")
+    parser.add_argument("--reset", "--clean", action="store_true", help="強制清除關聯的 checkpoint 與 review 快取檔")
+    parser.add_argument("--model", type=str, default=None, help="呼叫模型名稱（若未指定則根據 Provider 自動匹配最佳預設）")
     parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
+    parser.add_argument("--max-review-cycles", type=int, default=2, help="AI 審查與修復的最大交替輪次（防死循環）")
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
-    parser.add_argument("--gemini", "--google", action="store_true", dest="gemini", help="★ 使用 Google AI Studio Gemini 免費端點 (https://generativelanguage.googleapis.com/v1beta/openai/)")
-    parser.add_argument("--free-glm", "--glm5", "--glm", action="store_true", dest="free_glm", help="★ 使用 OpenRouter Free GLM 5.2 免費模型端點 (https://openrouter.ai/api/v1)")
-    parser.add_argument("--opencode", "--go", action="store_true", dest="opencode", help="★ 使用 OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)")
-    parser.add_argument("--zen", action="store_true", help="使用 OpenCode Zen 按量計費端點 (https://opencode.ai/zen/v1)")
     parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL")
     parser.add_argument("--api-key", type=str, default=None, help="直接指定 API Key 字串")
     parser.add_argument("--api-key-file", type=str, default=None, help="指定 API Key 檔案路徑")
@@ -3304,7 +3312,6 @@ def main():
     if not args.file and not args.recursive:
         parser.error("必須提供 --file <檔案路徑>（單檔模式）或 --recursive [目錄路徑]（遞迴批次模式）")
 
-    # 若未指定任何手動模式，預設啟動 auto 流水線
     if not any([args.generate, args.fix_gaps, args.review, args.fix]):
         args.auto = True
 
@@ -3312,48 +3319,43 @@ def main():
     main_log_path = "batch_sutra_review.log" if is_batch_mode else os.path.splitext(args.output or auto_output_path(args.file))[0] + "_review_log.txt"
     logger = setup_logger(main_log_path)
 
-    is_opencode_provider = args.opencode or args.zen
-    is_free_glm_provider = args.free_glm
-    is_gemini_provider = args.gemini
+    # 取得提供商預設參數
+    p_info = PROVIDER_DEFAULTS[args.provider]
+    base_url = args.base_url or p_info["base_url"]
+    provider_name = p_info["name"]
+    model_name = args.model or p_info["default_model"]
 
-    if args.gemini:
-        base_url = args.base_url or "https://generativelanguage.googleapis.com/v1beta/openai/"
-        provider_name = "Google AI Studio (Gemini Free 每日 1500 額度)"
-        if args.model == "deepseek-v4-flash":
-            args.model = "gemini-flash-latest"
-    elif args.free_glm:
-        base_url = args.base_url or "https://openrouter.ai/api/v1"
-        provider_name = "OpenRouter Free GLM 5.2 (https://openrouter.ai/api/v1)"
-        if args.model == "deepseek-v4-flash":
-            args.model = "z-ai/glm-5.2:free"
-    elif args.zen:
-        base_url = args.base_url or "https://opencode.ai/zen/v1"
-        provider_name = "OpenCode Zen 按量計費 (https://opencode.ai/zen/v1)"
-    elif args.opencode:
-        base_url = args.base_url or "https://opencode.ai/zen/go/v1"
-        provider_name = "OpenCode Go 訂閱端點 (https://opencode.ai/zen/go/v1)"
-    else:
-        base_url = args.base_url or "https://api.deepseek.com"
-        provider_name = "DeepSeek 官方 API"
+    # 快取重置處理
+    if args.reset and args.file:
+        target_md = args.output or auto_output_path(args.file)
+        cp_path = os.path.splitext(target_md)[0] + "_checkpoint.json"
+        rv_path = os.path.splitext(target_md)[0] + "_review.json"
+        for p in [cp_path, rv_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    logger.info(f"🧹 已清除快取檔：{p}")
+                except Exception:
+                    pass
 
     key_pool = load_api_keys(
         key_file=args.api_key_file,
         api_key_str=args.api_key,
-        is_opencode=is_opencode_provider,
-        is_free_glm=is_free_glm_provider,
-        is_gemini=is_gemini_provider
+        is_opencode=(args.provider in ["opencode", "zen"]),
+        is_free_glm=(args.provider == "free_glm"),
+        is_gemini=(args.provider == "gemini")
     )
     if not key_pool:
         return
 
     init_key = key_pool.get_current_key()
     logger.info(
-        f"API 提供商: {provider_name} ({base_url}) | 模型: {args.model} | "
+        f"API 提供商: {provider_name} ({base_url}) | 模型: {model_name} | "
         f"金鑰池: 共載入 {len(key_pool)} 把 Key (初始: {key_pool.mask_key(init_key)})"
     )
     client = OpenAI(api_key=init_key, base_url=base_url, timeout=args.timeout)
-    client.key_pool = key_pool  # 綁定金鑰池至 client 物件
-    client.debug_mode = args.debug  # 綁定 debug 模式開關
+    client.key_pool = key_pool
+    client.debug_mode = args.debug
 
     # 批次遞迴處理路由
     if is_batch_mode:
@@ -3362,7 +3364,7 @@ def main():
         if not pairs:
             logger.warning(f"⚠️ 在目錄 {search_dir} 下未找到任何匹配的 *_銷文.md 與 .txt 經文檔案組合！")
             return
-        run_batch(args, client, args.model, pairs, logger)
+        run_batch(args, client, model_name, pairs, logger)
         return
 
     # 單檔模式處理路由
@@ -3390,15 +3392,16 @@ def main():
 
     # 單檔模式路由
     if args.auto:
-        run_pipeline(args, client, args.model, sutra_text, style, args.output, logger)
+        run_pipeline(args, client, model_name, sutra_text, style, args.output, logger)
     elif args.generate:
-        run_generate(args, client, args.model, sutra_text, args.output, logger)
+        run_generate(args, client, model_name, sutra_text, args.output, logger)
     elif args.fix_gaps:
-        run_fix_gaps(args, client, args.model, sutra_text, segments, style, args.output, logger)
+        run_fix_gaps(args, client, model_name, sutra_text, segments, style, args.output, logger)
     elif args.review:
-        run_review(args, client, args.model, sutra_text, segments, style, args.output, logger)
+        run_review(args, client, model_name, sutra_text, segments, style, args.output, logger)
     elif args.fix or args.dry_run:
-        run_fix(args, client, args.model, sutra_text, segments, args.output, logger)
+        run_fix(args, client, model_name, sutra_text, segments, args.output, logger)
+        
 
 if __name__ == "__main__":
     try:
