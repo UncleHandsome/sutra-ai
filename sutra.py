@@ -132,6 +132,40 @@ class ApiKeyPool:
         self.all_keys = [k.strip() for k in keys if k and k.strip()]
         self.active_keys = list(self.all_keys)
         self.current_idx = 0
+        self.last_cycle_start = time.time()
+
+    def next_key_for_request(
+        self,
+        client: Any,
+        logger: logging.Logger,
+        target_cooldown: float = 0.0
+    ) -> str:
+        """★ 每一個 Request 輪流切換至下一把 Key，並於繞回頭時依剩餘可用數量動態節流"""
+        if not self.active_keys:
+            return ""
+
+        # 判斷是否即將繞回池首（到頭）
+        is_cycling_to_head = (self.current_idx + 1) >= len(self.active_keys)
+
+        # 輪轉至下一把 Key
+        self.current_idx = (self.current_idx + 1) % len(self.active_keys)
+        new_key = self.active_keys[self.current_idx]
+        self._apply_key_to_client(client, new_key)
+
+        # 到頭時進行動態節流（剩餘可用 Key 越少，整輪耗時越短，需等待補足的冷卻時間越長）
+        if is_cycling_to_head and target_cooldown > 0:
+            now = time.time()
+            elapsed = now - self.last_cycle_start
+            wait_time = max(0.0, target_cooldown - elapsed)
+            if wait_time > 0:
+                logger.info(
+                    f"  ⏳ [金鑰輪轉到頭] 剩餘可用金鑰 {len(self.active_keys)} 把，"
+                    f"動態節流等待 {wait_time:.1f} 秒以冷卻金鑰..."
+                )
+                time.sleep(wait_time)
+            self.last_cycle_start = time.time()
+
+        return new_key
 
     def get_current_key(self) -> str:
         if not self.active_keys:
@@ -711,55 +745,18 @@ def request_and_validate_segment(
             logger.warning("\n🛑 使用者中斷了修復流程 (Ctrl+C)")
             raise
         except Exception as e:
-            err_msg = str(e)
-            # 模型不可用或已被下線（如 404 unavailable for free），直接中止，避免無效輪換金鑰
-            model_fatal_keywords = [
-                "unavailable for free", "use this slug instead", "model_not_found",
-                "does not exist", "no allowed providers are available"
-            ]
-            if any(kw in err_msg.lower() for kw in model_fatal_keywords):
-                logger.critical(f"❌ [模型不可用] 模型 '{model}' 無法使用 ({err_msg})！請使用 --model 指定其他可用模型。")
-                return None, None, True
-
-            fatal_keywords = [
-                "insufficient balance", "creditserror", "authenticationerror",
-                "invalid_api_key", "401", "402", "payment required"
-            ]
-            is_fatal = any(kw in err_msg.lower() for kw in fatal_keywords)
-
-            if is_fatal:
-                if pool:
-                    all_dead = pool.mark_current_dead(client, logger, reason=err_msg)
-                    if all_dead:
-                        logger.error("❌ 所有 API 金鑰皆已失效或餘額不足！流水線立即安全中止。")
-                        return None, None, True
-                    # 成功切換到其他 Key，立即重試
-                    time.sleep(1)
-                    continue
-                else:
-                    logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！流水線立即中止。")
-                    return None, None, True
-
-            # 一般限流或連線異常切換
-            if pool and pool.has_multiple():
-                pool.rotate_client(client, logger, reason=f"API 請求異常 ({e})")
-                backoff_time = 1.5
-            else:
-                is_free_or_rate_limit = (
-                    ":free" in model.lower()
-                    or "openrouter" in str(client.base_url).lower()
-                    or "googleapis" in str(client.base_url).lower()
-                    or "429" in err_msg
-                    or "rate" in err_msg.lower()
-                    or "quota" in err_msg.lower()
-                )
-                backoff_time = min(45, (retry + 1) * 15) if is_free_or_rate_limit else (retry + 1) * 3
-
-            logger.error(
-                f"    ❌ API 呼叫失敗 ({e})，當前待處理經文剩餘 {len(normalize_text(remaining_text))} 字，"
-                f"等待 {backoff_time} 秒後進行第 {retry + 1}/{max_retries} 次重試..."
+            should_terminate, backoff = handle_api_exception(
+                e=e,
+                client=client,
+                model=model,
+                logger=logger,
+                retry=retry,
+                max_retries=max_retries,
+                context_desc=f"待處理經文剩餘 {len(normalize_text(remaining_text))} 字"
             )
-            time.sleep(backoff_time)
+            if should_terminate:
+                return None, None, True
+            time.sleep(backoff)
 
     return None, None, False
     
@@ -903,6 +900,36 @@ def find_missing_gaps(sutra_text: str, completed_sentences: List[str]) -> List[S
 
     return gaps
 
+def calculate_and_log_coverage(
+    sutra_text: str,
+    segments: List[str],
+    logger: Optional[logging.Logger] = None,
+    title: str = ""
+) -> Tuple[float, int, int, List[SutraGap]]:
+    """
+    統一計算經文覆蓋率，並可選性印出統計報表
+    回傳: (coverage_rate, covered_chars, total_chars, gaps)
+    """
+    gaps = find_missing_gaps(sutra_text, segments)
+    total_chars = len(normalize_text(sutra_text))
+    gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in gaps)
+    covered_chars = max(0, total_chars - gap_chars)
+    coverage_rate = (covered_chars / max(1, total_chars)) * 100
+
+    if logger:
+        header_title = f" [{title}]" if title else ""
+        logger.info("\n" + "=" * 65)
+        logger.info(f"📊 經文覆蓋率{header_title}: {coverage_rate:.2f}% ({covered_chars}/{total_chars} 純漢字)")
+        if gaps:
+            logger.warning(f"⚠️ 尚有 {len(gaps)} 處未完成區段：")
+            for idx, g in enumerate(gaps, 1):
+                gap_txt = getattr(g, "gap_text", "")
+                logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(gap_txt))} 字 | 預覽: 『{gap_txt[:40]}...』")
+        else:
+            logger.info("🎉 經文已 100% 銷文完畢，全文完整無缺！")
+        logger.info("=" * 65)
+
+    return coverage_rate, covered_chars, total_chars, gaps
 
 def get_source_slice(
     sutra_text: str,
@@ -1226,19 +1253,21 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
         if s.strip() and s.strip() != "---"
     ]
 
-    # ★ 關鍵修復：提取所有段落前，將正文前出現的所有導讀、前言與序文完整保留並併入 header（具備防重複疊加檢查）
+    # ★ 關鍵修復：正文前導讀/前言完整保留，並依段落特徵精確去重，徹底防止重複累積
     raw_sections = []
     found_first_valid = False
     prefix_notes = []
+    existing_header_clean = normalize_text(header)
+
     for b in raw_blocks:
         if not found_first_valid:
             if extract_sentence(b):
                 found_first_valid = True
                 raw_sections.append(b)
             else:
-                b_str = b.strip()
-                if b_str and b_str not in header:
-                    prefix_notes.append(b_str)
+                b_clean = normalize_text(b)
+                if b.strip() and (b_clean not in existing_header_clean):
+                    prefix_notes.append(b.strip())
         else:
             raw_sections.append(b)
 
@@ -1450,6 +1479,142 @@ def update_md_file(
     safe_write_file(filepath, reordered_content)
     logger.info(f"✨ MD 檔案已安全更新（已備份 .bak）並依原典物理位置重排：{filepath}")
 
+# ============================================================
+#  共用 API 異常處理與 JSON 容錯解析輔助
+# ============================================================
+def handle_api_exception(
+    e: Exception,
+    client: OpenAI,
+    model: str,
+    logger: logging.Logger,
+    retry: int,
+    max_retries: int,
+    context_desc: str = ""
+) -> Tuple[bool, float]:
+    """
+    統一處理 API 請求異常、金鑰剔除/輪換與階梯退避時間計算
+    回傳: (should_terminate: bool, backoff_seconds: float)
+    """
+    err_msg = str(e)
+    pool = getattr(client, "key_pool", None)
+
+    # 1. 模型不可用或下線
+    model_fatal_keywords = [
+        "unavailable for free", "use this slug instead", "model_not_found",
+        "does not exist", "no allowed providers are available"
+    ]
+    if any(kw in err_msg.lower() for kw in model_fatal_keywords):
+        logger.critical(f"❌ [模型不可用] 模型 '{model}' 無法使用 ({err_msg})！請使用 --model 指定其他可用模型。")
+        return True, 0.0
+
+    # 2. 帳號失效、欠費或每日配額耗盡
+    fatal_keywords = [
+        "insufficient balance", "creditserror", "authenticationerror",
+        "invalid_api_key", "401", "402", "payment required",
+        "exceeded your current quota", "resource_exhausted", "quota exceeded",
+        "generaterequestsperday", "perday"
+    ]
+    is_fatal = any(kw in err_msg.lower() for kw in fatal_keywords)
+
+    if is_fatal:
+        if pool:
+            all_dead = pool.mark_current_dead(client, logger, reason=f"額度耗盡/失效 ({err_msg[:40]})")
+            if all_dead:
+                logger.error("❌ 所有 API 金鑰皆已失效或配額耗盡！流水線立即安全中止。")
+                return True, 0.0
+            return False, 1.0  # 切換新 Key 後立即重試
+        else:
+            logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！流水線立即中止。")
+            return True, 0.0
+
+    # 3. 一般限流（RPM）或網路短暫異常
+    if pool and pool.has_multiple():
+        pool.rotate_client(client, logger, reason=f"API 請求異常 ({e})")
+        backoff_time = 1.5
+    else:
+        is_free_or_rate_limit = (
+            ":free" in model.lower()
+            or "openrouter" in str(client.base_url).lower()
+            or "googleapis" in str(client.base_url).lower()
+            or "429" in err_msg
+            or "rate" in err_msg.lower()
+            or "quota" in err_msg.lower()
+        )
+        backoff_time = min(45, (retry + 1) * 15) if is_free_or_rate_limit else (retry + 1) * 3
+
+    desc_str = f"（{context_desc}）" if context_desc else ""
+    logger.error(
+        f"    ❌ API 呼叫失敗 ({e}){desc_str}，等待 {backoff_time:.1f} 秒後進行第 {retry + 1}/{max_retries} 次重試..."
+    )
+    return False, backoff_time
+
+
+def parse_review_json_response(raw_text: str, max_idx: int) -> List[ReviewIssue]:
+    """
+    強韌解析 AI 審查回傳的 JSON 字串（相容思維鏈、Markdown 圍欄、字典/陣列包裝與越界過濾）
+    """
+    text = RE_THINK_TAG.sub("", raw_text).strip()
+    text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.MULTILINE).strip()
+    text = re.sub(r",\s*([\]}])", r"\1", text)
+
+    parsed = []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\[[\s\S]*\]", text)
+        if m:
+            try:
+                parsed = json.loads(re.sub(r",\s*([\]}])", r"\1", m.group()))
+            except json.JSONDecodeError:
+                pass
+        if not parsed:
+            m_obj = re.search(r"\{[\s\S]*\}", text)
+            if m_obj:
+                try:
+                    parsed = json.loads(re.sub(r",\s*([\]}])", r"\1", m_obj.group()))
+                except json.JSONDecodeError:
+                    pass
+
+    # 結構標準化為陣列
+    issues_raw = []
+    if isinstance(parsed, dict):
+        for k in ["issues", "data", "result", "problems"]:
+            if k in parsed and isinstance(parsed[k], list):
+                issues_raw = parsed[k]
+                break
+        if not issues_raw and ("index" in parsed or "merge_indices" in parsed or "type" in parsed):
+            issues_raw = [parsed]
+    elif isinstance(parsed, list):
+        issues_raw = parsed
+
+    # 轉換並過濾非法/越界索引
+    valid_issues: List[ReviewIssue] = []
+    for raw_iss in issues_raw:
+        if not isinstance(raw_iss, dict):
+            continue
+        raw_merge = raw_iss.get("merge_indices") or [raw_iss.get("index", -1)]
+        filtered_merge = []
+        for idx in raw_merge:
+            if isinstance(idx, int) and 0 <= idx <= max_idx:
+                filtered_merge.append(idx)
+            elif isinstance(idx, str) and idx.strip().isdigit():
+                i_val = int(idx.strip())
+                if 0 <= i_val <= max_idx:
+                    filtered_merge.append(i_val)
+
+        if filtered_merge:
+            valid_issues.append(ReviewIssue(
+                index=filtered_merge[0],
+                issue_type=raw_iss.get("type") or raw_iss.get("issue_type") or "斷句邊界調整",
+                problem=raw_iss.get("problem", ""),
+                merge_indices=sorted(list(set(filtered_merge))),
+                gap_text=raw_iss.get("gap_text"),
+                position=raw_iss.get("position")
+            ))
+
+    return valid_issues
+
 def stream_completion(
     client: OpenAI,
     model: str,
@@ -1467,17 +1632,37 @@ def stream_completion(
         ":free" in model.lower()
         or "glm" in model.lower()
         or "gemini" in model.lower()
+        or "dots" in model.lower()
         or "openrouter" in str(client.base_url).lower()
         or "googleapis" in str(client.base_url).lower()
     )
-    max_tokens_val = 65536 if is_third_party_or_free else 384000
 
+    # 精準適配各模型最大輸出 Token 規格
+    m_lower = model.lower()
+    if "dots" in m_lower:
+        max_tokens_val = 512000
+    elif "glm-5.2" in m_lower or "glm" in m_lower:
+        max_tokens_val = 256000
+    elif "gemini" in m_lower or "googleapis" in str(client.base_url).lower():
+        max_tokens_val = 65536
+    elif is_third_party_or_free:
+        max_tokens_val = 65536
+    else:
+        max_tokens_val = 384000
+
+    # 1. 決定單把 Key 的目標安全冷卻間隔 (秒)
+    target_interval = 0.0
     if is_third_party_or_free:
         if "gemini" in model.lower() or "googleapis" in str(client.base_url).lower():
             target_interval = 13.0 if ("pro" in model.lower()) else 5.2
         else:
             target_interval = 6.0
 
+    # 2. 每一個 Request 輪流換下一把 Key，並於繞回頭時依剩餘可用數量動態節流
+    pool = getattr(client, "key_pool", None)
+    if pool and len(pool.active_keys) > 0:
+        pool.next_key_for_request(client, logger, target_cooldown=target_interval)
+    elif is_third_party_or_free:
         now = time.time()
         elapsed = now - _LAST_API_CALL_TIME
         if elapsed < target_interval:
@@ -1496,7 +1681,17 @@ def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if reasoning_effort and not is_third_party_or_free:
+    if is_gemini_endpoint:
+        # ★ 關閉 Gemini 內建安全過濾器，防止佛經名相（貪愛、老死、非有非無）觸發攔截斷句
+        create_kwargs["extra_body"] = {
+            "safety_settings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+        }
+    elif reasoning_effort and not is_third_party_or_free:
         create_kwargs["extra_body"] = {
             "thinking": {"type": "enabled"},
             "reasoning_effort": reasoning_effort,
@@ -1571,9 +1766,11 @@ def stream_completion(
     if target_usage_source:
         log_cache_metrics(logger, target_usage_source, action_name=action_name)
 
-    # 準確檢查整個串流歷程是否遭遇長度截斷
-    if detected_finish_reason == "length":
-        logger.warning("  ⚠️ [輸出截斷警告] 模型輸出觸及 max_tokens 上限，內容可能不完整！")
+    # 準確檢查整個串流歷程是否遭遇長度截斷或安全過濾攔截
+    if detected_finish_reason in ["length", "MAX_TOKENS"]:
+        logger.warning("  ⚠️ [輸出截斷警告] 模型輸出觸及 max_tokens (65536) 上限，內容可能不完整！")
+    elif detected_finish_reason in ["safety", "SAFETY", "content_filter"]:
+        logger.warning("  ⚠️ [安全過濾警告] 內容觸發 Gemini 內建安全過濾機制被後端強制截斷！")
 
     _LAST_API_CALL_TIME = time.time()
     full_output = "".join(content_parts)
@@ -1781,20 +1978,14 @@ def fix_single_issue(
     output_path: Optional[str] = None
 ) -> Tuple[Optional[str], List[int]]:
     """針對特定審查問題進行段落合併重寫"""
-    # 支援物件與字典雙重存取（確保 merge_indices 為空時能保底退回 index）
-    if hasattr(issue, "merge_indices"):
-        raw_m = issue.merge_indices if (issue.merge_indices and len(issue.merge_indices) > 0) else [getattr(issue, "index", 0)]
-        merge_idx = sorted(list(set(raw_m)))
-        issue_type_str = getattr(issue, "issue_type", "")
-        problem_desc = getattr(issue, "problem", "")
-        gap_text = getattr(issue, "gap_text", "") or ""
-        position = getattr(issue, "position", None)
-    else:
-        merge_idx = sorted(list(set(issue.get("merge_indices") or [issue.get("index", 0)])))
-        issue_type_str = issue.get("type", "")
-        problem_desc = issue.get("problem", "")
-        gap_text = issue.get("gap_text", "") or ""
-        position = issue.get("position")
+    # 一行標準化為 ReviewIssue 物件
+    iss = ReviewIssue.from_dict(issue) if isinstance(issue, dict) else issue
+    raw_m = iss.merge_indices if (iss.merge_indices and len(iss.merge_indices) > 0) else [iss.index]
+    merge_idx = sorted(list(set(raw_m)))
+    issue_type_str = iss.issue_type
+    problem_desc = iss.problem
+    gap_text = iss.gap_text or ""
+    position = iss.position
 
     valid_merge_idx = [i for i in merge_idx if 0 <= i < len(segments)]
     merge_segs = [segments[i] for i in valid_merge_idx]
@@ -2264,7 +2455,7 @@ def ai_review(
 
     for retry in range(max_retries):
         try:
-            text = stream_completion(
+            raw_reply = stream_completion(
                 client=client,
                 model=model,
                 system_prompt=REVIEW_SYSTEM,
@@ -2274,132 +2465,29 @@ def ai_review(
                 action_name=f"AI 斷句審查 (重試 {retry + 1}/{max_retries})"
             ).strip()
 
-            text = RE_THINK_TAG.sub("", text).strip()
-            text = re.sub(r"^\s*```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
-            text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.MULTILINE).strip()
-            text = re.sub(r",\s*([\]}])", r"\1", text)
-
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                m = re.search(r"\[[\s\S]*\]", text)
-                if m:
-                    clean_m = re.sub(r",\s*([\]}])", r"\1", m.group())
-                    try:
-                        parsed = json.loads(clean_m)
-                    except json.JSONDecodeError:
-                        parsed = []
-                else:
-                    # 容錯：嘗試提取包裹在外層的 JSON 物件 {...}
-                    m_obj = re.search(r"\{[\s\S]*\}", text)
-                    if m_obj:
-                        clean_obj = re.sub(r",\s*([\]}])", r"\1", m_obj.group())
-                        try:
-                            parsed = json.loads(clean_obj)
-                        except json.JSONDecodeError:
-                            parsed = []
-                    else:
-                        parsed = []
-
-            if isinstance(parsed, dict):
-                issues_raw = []
-                for k in ["issues", "data", "result", "problems"]:
-                    if k in parsed and isinstance(parsed[k], list):
-                        issues_raw = parsed[k]
-                        break
-                # 若為單一問題物件直接包裝為陣列，防止漏失
-                if not issues_raw and ("index" in parsed or "merge_indices" in parsed or "type" in parsed):
-                    issues_raw = [parsed]
-            elif isinstance(parsed, list):
-                issues_raw = parsed
-            else:
-                issues_raw = []
-
-            valid_issues: List[ReviewIssue] = []
-            max_idx = len(segments) - 1
-            for raw_iss in issues_raw:
-                if not isinstance(raw_iss, dict):
-                    continue
-                raw_merge = raw_iss.get("merge_indices") or [raw_iss.get("index", -1)]
-                filtered_merge = []
-                for idx in raw_merge:
-                    if isinstance(idx, int) and 0 <= idx <= max_idx:
-                        filtered_merge.append(idx)
-                    elif isinstance(idx, str) and idx.strip().isdigit():
-                        i_val = int(idx.strip())
-                        if 0 <= i_val <= max_idx:
-                            filtered_merge.append(i_val)
-                if filtered_merge:
-                    issue_obj = ReviewIssue(
-                        index=filtered_merge[0],
-                        issue_type=raw_iss.get("type") or raw_iss.get("issue_type") or "斷句邊界調整",
-                        problem=raw_iss.get("problem", ""),
-                        merge_indices=sorted(list(set(filtered_merge))),
-                        gap_text=raw_iss.get("gap_text"),
-                        position=raw_iss.get("position")
-                    )
-                    valid_issues.append(issue_obj)
-
-            filtered_count = max(0, len(issues_raw) - len(valid_issues))
-            logger.info(
-                f"AI 審查完成：檢出 {len(valid_issues)} 處有效邏輯割裂或斷句不當之處"
-                f"（已過濾 {filtered_count} 處越界幻覺）"
-            )
+            valid_issues = parse_review_json_response(raw_reply, max_idx=len(segments) - 1)
+            logger.info(f"AI 審查完成：檢出 {len(valid_issues)} 處有效邏輯割裂或斷句不當之處")
             return valid_issues
 
         except KeyboardInterrupt:
             logger.warning("\n🛑 使用者中斷了 AI 審查流程 (Ctrl+C)")
             raise
         except Exception as e:
-            err_msg = str(e)
-            # 模型不可用或已被下線（如 404 unavailable for free），直接中止，避免無效輪換金鑰
-            model_fatal_keywords = [
-                "unavailable for free", "use this slug instead", "model_not_found",
-                "does not exist", "no allowed providers are available"
-            ]
-            if any(kw in err_msg.lower() for kw in model_fatal_keywords):
-                logger.critical(f"❌ [模型不可用] 模型 '{model}' 無法使用 ({err_msg})！請使用 --model 指定其他可用模型。")
+            should_terminate, backoff = handle_api_exception(
+                e=e,
+                client=client,
+                model=model,
+                logger=logger,
+                retry=retry,
+                max_retries=max_retries,
+                context_desc="AI 審查呼叫"
+            )
+            if should_terminate:
                 return None
-
-            fatal_keywords = [
-                "insufficient balance", "creditserror", "authenticationerror",
-                "invalid_api_key", "401", "402", "payment required"
-            ]
-            is_fatal = any(kw in err_msg.lower() for kw in fatal_keywords)
-
-            if is_fatal:
-                if pool:
-                    all_dead = pool.mark_current_dead(client, logger, reason=err_msg)
-                    if all_dead:
-                        logger.error("❌ 所有 API 金鑰皆已失效或餘額不足！AI 審查流程安全中止。")
-                        return None
-                    time.sleep(1)
-                    continue
-                else:
-                    logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！AI 審查流程中止。")
-                    return None
-
-            if pool and pool.has_multiple():
-                pool.rotate_client(client, logger, reason=f"AI 審查遭遇限制/異常 ({e})")
-                backoff = 1.5
-            else:
-                is_free_or_rate_limit = (
-                    ":free" in model.lower()
-                    or "openrouter" in str(client.base_url).lower()
-                    or "googleapis" in str(client.base_url).lower()
-                    or "429" in err_msg
-                    or "rate" in err_msg.lower()
-                    or "quota" in err_msg.lower()
-                )
-                # 遭遇 429 限流時，單 Key 進行 15s -> 30s -> 45s 階梯退避
-                backoff = min(45, (retry + 1) * 15) if is_free_or_rate_limit else (retry + 1) * 3
-
-            logger.error(f"  ❌ AI 審查呼叫失敗 ({e})，等待 {backoff} 秒後進行第 {retry+1}/{max_retries} 次重試...")
             time.sleep(backoff)
 
     logger.error(f"❌ AI 審查重試 {max_retries} 次皆失敗，放棄本次審查。")
     return None
-
 
 def merge_overlapping_issues(
     issues: List[Any],
@@ -2648,23 +2736,9 @@ def run_fill_gaps(
             break
 
     # 計算最終成果報表
+    logger.info(f"\n🎉 {mode_title} 執行完畢！本次共產出/補齊 {total_added_blocks} 個段落。")
     latest_segments = extract_segments_from_md(output_path)
-    final_gaps = find_missing_gaps(sutra_text, latest_segments)
-    total_gaps_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in final_gaps)
-    covered_chars = max(0, clean_sutra_len - total_gaps_chars)
-    coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
-
-    logger.info("\n" + "=" * 65)
-    logger.info(f"🎉 {mode_title} 執行完畢！本次共產出/補齊 {total_added_blocks} 個段落。")
-    logger.info(f"📊 經文總覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
-    if final_gaps:
-        logger.warning(f"⚠️ 尚有 {len(final_gaps)} 處未完成區段：")
-        for idx, g in enumerate(final_gaps, 1):
-            gap_txt = getattr(g, "gap_text", "")
-            logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(gap_txt))} 字 | 預覽: 『{gap_txt[:40]}...』")
-    else:
-        logger.info("🎉 經文已 100% 銷文完畢，全文完整無缺！")
-    logger.info("=" * 65)
+    calculate_and_log_coverage(sutra_text, latest_segments, logger=logger, title=mode_title)
 
 def run_generate(
     args: argparse.Namespace,
@@ -2795,7 +2869,8 @@ def run_fix(
 ) -> bool:
     """依審查報告執行批次修正（回傳修復成功狀態）"""
     is_standalone_fix = (all_issues is None)
-    review_path = os.path.splitext(output_path)[0] + "_review.json"
+    review_path, checkpoint_path, _ = get_auxiliary_paths(output_path)
+
     if all_issues is None:
         if not os.path.exists(review_path):
             logger.error(f"找不到審查結果報告: {review_path}，請先執行 --review")
@@ -2821,8 +2896,6 @@ def run_fix(
         logger.info(f"  段落 [{m_str}] ({iss.get('type','')})：{iss.get('problem','')}")
 
     logger.info(f"\n【Phase 2】開始執行段落合併與重新銷文（本輪預計修正 {max_fix} 處）...")
-
-    checkpoint_path = os.path.splitext(output_path)[0] + "_checkpoint.json"
     cached_corrections = load_checkpoint(checkpoint_path)
 
     corrections = []
@@ -2898,24 +2971,8 @@ def run_fix(
         logger.info("\n" + "=" * 65)
         logger.info(f"🎉 任務圓滿完成！成功重寫並合併 {len(corrections)} 處問題段落。")
         logger.info(f"最終輸出：{output_path}")
-        logger.info("=" * 65)
-
         latest_segments = extract_segments_from_md(output_path)
-        remaining_gaps = find_missing_gaps(sutra_text, latest_segments)
-        clean_sutra_len = len(normalize_text(sutra_text))
-        total_gaps_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in remaining_gaps)
-        covered_chars = max(0, clean_sutra_len - total_gaps_chars)
-        coverage_rate = (covered_chars / max(1, clean_sutra_len)) * 100
-
-        logger.info(f"📊 修正後經文覆蓋率: {coverage_rate:.2f}% ({covered_chars}/{clean_sutra_len} 純漢字)")
-        if remaining_gaps:
-            logger.warning(f"⚠️ 尚有 {len(remaining_gaps)} 處未銷文漏段：")
-            for idx, g in enumerate(remaining_gaps, 1):
-                gap_txt = getattr(g, "gap_text", "")
-                logger.warning(f"  [{idx}] 遺漏字數: {len(normalize_text(gap_txt))} 字 | 預覽: 『{gap_txt[:40]}...』")
-        else:
-            logger.info("🎉 經文已 100% 銷文完畢，無任何遺漏與割裂！")
-        logger.info("=" * 65)
+        calculate_and_log_coverage(sutra_text, latest_segments, logger=logger, title="修復完成覆蓋率")
     return True
 
 # ============================================================
@@ -3534,7 +3591,7 @@ def main():
     parser.add_argument("--reset", "--clean", action="store_true", help="強制清除關聯的 checkpoint 與 review 快取檔")
     parser.add_argument("--model", type=str, default=None, help="呼叫模型名稱（若未指定則根據 Provider 自動匹配最佳預設）")
     parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
-    parser.add_argument("--max-review-cycles", type=int, default=2, help="AI 審查與修復的最大交替輪次（防死循環）")
+    parser.add_argument("--max-review-cycles", type=int, default=5, help="AI 審查與修復的最大交替輪次（防死循環）")
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
     parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL")
