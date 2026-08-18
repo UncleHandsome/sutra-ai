@@ -1,34 +1,43 @@
 # 📖 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具 (`sutra.py`)
 
-一套專為漢傳大藏經、梵漢對勘與各類文言原典設計的 **「高精度銷文解義、斷句品質審查、斷點補漏與物理槽位重排」** 全自動閉環流水線工具。
+一套專為漢傳大藏經、梵漢對勘與各類文言原典設計的 **「高精度銷文解義、斷句品質審查、斷點補漏、物理槽位重排與遞迴批次校驗」** 全自動閉環流水線工具。
 
 ---
 
 ## 🌟 核心特性與底層機制
 
-1. **⚡ DeepSeek Prompt Cache 極致最佳化**
-   - 嚴格落實「靜態經文前置、動態指令後置」Prompt 結構，最大化鎖定 KV Cache 命中率，大幅縮短響應延遲並降低 API 成本（終端機即時輸出命中 Token 數與命中百分比）。
-2. **🧠 因明義理與動態指針推進引擎 (Dynamic Pointer Engine)**
-   - 移除非必要的硬性字數切分限制，由 AI 依佛教文法、因明論理、偈頌音律自主決定最佳斷句邊界。
-   - 具備「後綴錨點精準裁切」技術，長區間經文自動連續推進，徹底杜絕人工硬切、跳字遺漏與句首定型句回跳。
-   - 內建**末尾弱助詞防死鎖保護**（自動消化 `者、也、耳、矣、焉、哉、乎、耶、兮、歟、之` 等殘餘單字）。
-3. **🎯 雙標點體系全能適配 (`detect_punctuation_style`)**
-   - **現代新標點文本**：精準識別逗號、冒號、分號、引號，嚴防標點腰斬。
-   - **古典全句號文本**：通篇皆為句號時，智慧判定合法句讀與科判停頓，避免過度暴力合併。
-   - **無標點白文原典**：支援純漢字白文經文自動推進與分段銷文。
-4. **🔤 古籍文字學異體字單向歸一化 (`VARIANT_CHAR_MAP`)**
-   - 內建 23+ 組古今異體字對齊映射（如 `媅➔耽`、`睹➔覩`、`麤/麁➔粗`、`併➔并`、`嗔➔瞋`、`倶➔俱`、`缽➔鉢`、`祗/袛/衹/只➔祇`、`墮➔堕`、`辨➔辯`、`鷄➔雞`），徹底消除字形差異導致的定位漂移與漏段誤判。
-5. **🛡️ 嚴格品質校驗與在地零延遲修復 (Local Fast-Fix)**
-   - **五重品質防線**：防腰斬、防半偈、防起點跳字、防省略號（嚴禁 `...` / `（中略）`）、防結構欄位殘缺。
-   - **在地極速修復**：開頭孤立標點/括號殘肢（如 `🔹 原典：「）」`）自動在本地以正則清洗修復，**0 延遲且不耗費任何 API 額度**。
-6. **🔑 多金鑰池 (Key Pool) 自動輪換與 429 智慧自癒**
-   - 支援單一檔案配置多把 Key，遇 `429 頻率限制` 或額度耗盡時，自動於 **2 秒內切換至下一把 Key 立即重試**。
-   - 單金鑰模式遇 429 自動冷卻 30 秒退避重試；免費模型自動啟動 **15 秒請求頻率保護器**。
-7. **💾 斷點續傳 (Checkpoint) 與多層級檔案鎖容錯**
-   - 支援中途斷網/額度耗盡安全暫存（`_checkpoint.json`），再次執行即可「秒級接續」。
-   - 針對 Windows / OneDrive 雲端同步檔案鎖設計指數退避原子寫入與**緊急另存防禦機制**（`.emergency_[時間戳].txt`），確保資料絕對不遺失。
-8. **🧠 推理模型即時思考指示**
-   - 針對 DeepSeek-R1、Gemini 思考模式輸出即時心跳（`🧠`），即時掌握模型推理狀態。
+### 1. ⚡ DeepSeek Prompt Cache 極致最佳化
+- 嚴格落實「**靜態經文前置、動態指令後置**」Prompt 結構，最大化鎖定 KV Cache 命中率，大幅縮短響應延遲並降低 API 成本（終端機即時輸出命中 Token 數與命中百分比）。
+
+### 2. 🧠 因明義理與動態指針推進引擎 (Dynamic Pointer Engine)
+- 移除非必要的硬性字數切分限制，由 AI 依佛教文法、因明論理、偈頌音律自主決定最佳斷句邊界。
+- 具備「**後綴錨點精準裁切**」技術，長區間經文自動連續推進，徹底杜絕人工硬切、跳字遺漏與句首定型句回跳。
+- 內建**末尾弱助詞防死鎖保護**（自動消化 `者、也、耳、矣、焉、哉、乎、耶、兮、歟、之` 等殘餘單字）。
+
+### 3. 📂 遞迴批次全自動校驗流水線 (`--recursive` / `--batch`)
+- 支援目錄樹遞迴深度搜尋，自動匹配目錄下所有 `*_銷文.md` 與對應的原始經文（支援 `[檔名].txt`、`_經文.txt`、`_原典.txt`、`_原文.txt` 等命名規則）。
+- **崩潰隔離機制**：單檔遭遇格式錯誤或中斷時，自動保存進度並記錄獨立日誌，安全推進下一個檔案；全部檔案處理完畢後輸出總結報告。
+
+### 4. 🔑 多金鑰池 (Key Pool) 自動輪換與壞 Key 永久剔除 (Dead-Key Culling)
+- 支援單一檔案配置多把 Key，遇 `429 頻率限制` 時自動於 **1.5～2 秒內無縫切換至下一把 Key 立即重試**。
+- 遇餘額不足（402）、認證失效（401）等致命錯誤時，自動將該 Key **永久剔除**並即時接軌存活金鑰；僅在金鑰池全數陣亡時啟動批次熔斷保護。
+- 針對免費端點內建**動態間隔節流保護**（Gemini Flash 5.2 秒、Gemini Pro 13 秒、OpenRouter 6 秒）。
+
+### 5. 🛡️ 雙重品質防線：本地零延遲修復 + 孤本防雙殺保護
+- **本地極速修復 (Local Fast-Fix)**：原典開頭孤立標點/括號殘肢（如 `🔹 原典：「）」`）自動在本地以正則清洗修正，**0 延遲且完全不耗費任何 API 額度**。
+- **孤本防雙殺機制 (Anti-Double-Kill)**：審查建議刪除重複段落時，系統會自動核對其餘段落是否已保留備份；若為經文中僅存之孤本文句，強制取消刪除並交由 AI 重整校準，嚴防因過度精簡造成經文遺漏。
+
+### 6. 🎯 雙標點體系全能適配 (`detect_punctuation_style`)
+- **現代新標點文本**：精準識別逗號、冒號、分號、引號，嚴防標點腰斬。
+- **古典全句號文本**：通篇皆為句號時，智慧判定合法句讀與科判停頓，避免過度暴力合併。
+- **無標點白文原典**：支援純漢字白文經文自動推進與分段銷文。
+
+### 7. 🔤 古籍文字學異體字單向歸一化 (`VARIANT_CHAR_MAP`)
+- 內建 24+ 組古今異體字對齊映射（如 `媅➔耽`、`睹➔覩`、`麤/麁➔粗`、`併➔并`、`嗔➔瞋`、`倶➔俱`、`缽➔鉢`、`祗/袛/衹/只➔祇`、`墮➔堕`、`辨➔辯`、`鷄➔雞` 等），徹底消除字形差異導致的定位漂移與漏段誤判。
+
+### 8. 💾 斷點續傳 (Checkpoint) 與多層級檔案鎖容錯
+- 支援中途斷網/額度耗盡安全暫存（`_checkpoint.json`），再次執行即可「秒級接續」。
+- 針對 Windows / OneDrive 雲端同步檔案鎖設計指數退避原子寫入與**緊急另存防禦機制**（`.emergency_[時間戳].txt`），確保資料絕對不遺失。
 
 ---
 
@@ -43,21 +52,21 @@ pip install openai
 ### 2. 配置 API 金鑰
 支援三種配置方式（優先順序：**命令列參數 > 環境變數 > 金鑰檔案**）：
 
-#### 方式 A：檔案放置（推薦，支援多 Key 輪替）
+#### 方式 A：檔案放置（推薦，支援多 Key 輪替與壞 Key 自動淘汰）
 在 `sutra.py` 相同目錄下建立對應的文字檔（**支援一行一把 Key、逗號/分號分隔、引號包裹以及 `#` 或 `//` 註解**）：
 
 | 提供商 / 模式 | 優先讀取的金鑰檔名（擇一建立即可） |
 | :--- | :--- |
+| **DeepSeek 官方 API** | `api_key.txt`、`deepseek_key.txt`、`deepseek_api_key.txt`、`key.txt` |
 | **Google Gemini 免費端點** | `gemini_key.txt`、`google_key.txt`、`gemini_api_key.txt`、`api_key.txt` |
 | **OpenRouter / Free GLM** | `openrouter_key.txt`、`openrouter_api_key.txt`、`glm_key.txt`、`api_key.txt` |
 | **OpenCode 平台 (Go / Zen)** | `opencode_key.txt`、`opencode_api_key.txt`、`api_key.txt` |
-| **DeepSeek 官方 API** | `api_key.txt`、`deepseek_key.txt`、`deepseek_api_key.txt`、`key.txt` |
 
 > 💡 **多金鑰輪換範例（`api_key.txt`）**：
 > ```text
 > # 主金鑰
 > sk-d9a8f...01
-> # 備用金鑰（遇 429 自動 2 秒無縫輪換）
+> # 備用金鑰（遇 429 自動 1.5 秒無縫輪替，遇 401/402 自動永久剔除）
 > sk-b7c2e...02
 > sk-ff19a...03
 > ```
@@ -87,34 +96,50 @@ python sutra.py --file 1.txt --api-key "sk-xxxxxxxxxxxxxxxx"
 
 ## 🚀 常用指令速查 (Cheat Sheet)
 
+### 📌 單檔工作流
+
 | 應用情境 | 執行指令 | 說明 |
 | :--- | :--- | :--- |
-| **★ 一鍵全自動閉環 (最推薦)** | `python sutra.py --file 1.txt` | 預設模式，自動感知狀態（全新銷文 ➔ 深度審查 ➔ 瑕疵修復 ➔ 終局補漏） |
+| **★ 一鍵全自動閉環 (預設/推薦)** | `python sutra.py --file 1.txt` | 自動感知狀態（全新銷文 ➔ 深度審查 ➔ 瑕疵修復 ➔ 終局補漏） |
 | **從零全本全新銷文** | `python sutra.py --file 1.txt --generate` | 將整篇經文視為大漏段，從頭至尾推進產出銷文（別名：`--gen`） |
 | **專注補漏掃描** | `python sutra.py --file 1.txt --fix-gaps` | 快速比對原始經文，將漏掉的字句補齊並物理歸位（別名：`--gaps`） |
 | **僅執行 AI 深度審查** | `python sutra.py --file 1.txt --review` | 不修改檔案，產出因明與斷句分析報告 `1_銷文_review.json` |
 | **預覽修正清單 (Dry Run)** | `python sutra.py --file 1.txt --fix --dry-run` | 讀取 review.json 預覽待修項目，**不呼叫 API 且不更動檔案** |
 | **依報告執行修復** | `python sutra.py --file 1.txt --fix` | 讀取 review.json 針對標記問題段落進行重新銷文與合併重排 |
-| **使用 Google Gemini 免費模型** | `python sutra.py --file 1.txt --gemini` | 使用 Google AI Studio 端點（預設 `gemini-flash-latest`，別名：`--google`） |
-| **使用 OpenRouter Free GLM 5.2** | `python sutra.py --file 1.txt --free-glm` | 使用 OpenRouter 免費端點（預設 `z-ai/glm-5.2:free`，別名：`--glm`、`--glm5`） |
-| **切換 OpenCode Go 訂閱端點** | `python sutra.py --file 1.txt --opencode` | 使用 `https://opencode.ai/zen/go/v1` 訂閱端點（別名：`--go`） |
-| **切換 OpenCode Zen 計量端點** | `python sutra.py --file 1.txt --zen` | 使用 `https://opencode.ai/zen/v1` 按量計費端點 |
-| **開啟即時除錯輸出 (Debug)** | `python sutra.py --file 1.txt --debug` | 於終端機即時印出每次模型回傳的完整原始內容 (Raw Content) |
+
+### 📌 批次工作流
+
+| 應用情境 | 執行指令 | 說明 |
+| :--- | :--- | :--- |
+| **★ 遞迴批次全自動校驗** | `python sutra.py --recursive .` | 掃描當前目錄及所有子目錄，自動匹配所有經文檔案並逐一修至 100% 完工（別名：`--batch`） |
+| **指定子目錄批次校驗** | `python sutra.py --recursive ./sutras/` | 指定特定資料夾進行遞迴批次處理 |
+
+### 📌 模型與端點切換
+
+| 提供商 / 端點 | 執行指令範例 | 預設模型 |
+| :--- | :--- | :--- |
+| **DeepSeek 官方 API** | `python sutra.py --file 1.txt` | `deepseek-v4-flash` |
+| **Google Gemini 免費端點** | `python sutra.py --file 1.txt --gemini` | `gemini-flash-latest` (別名：`--google`) |
+| **OpenRouter Free GLM 5.2** | `python sutra.py --file 1.txt --free-glm` | `z-ai/glm-5.2:free` (別名：`--glm`, `--glm5`) |
+| **OpenCode Go 訂閱端點** | `python sutra.py --file 1.txt --opencode` | `deepseek-v4-flash` (別名：`--go`) |
+| **OpenCode Zen 計量端點** | `python sutra.py --file 1.txt --zen` | `deepseek-v4-flash` |
+| **開啟除錯輸出 (Debug)** | `python sutra.py --file 1.txt --debug` | 終端機即時印出模型回傳之原始內容 (Raw Content) |
 
 ---
 
-## 🛠️ 詳細工作模式與流水線架構
+## 🛠️ 核心工作模式與狀態機架構
 
 ### 1. 🌟 一鍵全流程閉環流水線 (`--auto` / 預設)
-系統內建具備防死鎖機制的**智慧狀態機（Pipeline State Machine）**，自動判斷切入點：
+系統內建具備防死鎖機制的**智慧狀態機（Pipeline State Machine）**，自動判斷切入點並循環推進至完工：
 
 ```mermaid
 graph TD
     A[輸入原始經文 txt] --> B{狀態感知器 detect_current_state}
     B -->|MD 檔不存在或為空| C[Stage 1: 全本全新銷文 NEED_GENERATE]
+    B -->|中途停止/覆蓋率未達95%| C
     B -->|發現中斷暫存檔| D[Stage 3: 接續未完修復 NEED_CHECKPOINT_FIX]
     B -->|存在未執行的有效 review.json| E[Stage 3: 依報告修復與補漏 NEED_REVIEW_FIX]
-    B -->|MD 就緒且無審查報告| F[Stage 2: AI 因明義理深度審查 NEED_AI_REVIEW]
+    B -->|初稿就緒且無審查報告| F[Stage 2: AI 因明義理深度審查 NEED_AI_REVIEW]
     C --> F
     D --> E
     F -->|檢出問題項目| E
@@ -137,6 +162,11 @@ graph TD
 - **修復階段 (`--fix`)**：
   讀取審查報告，針對問題區間重新切片、呼叫 AI 重寫合併，修復完成後自動清除快取報告。
 
+### 4. 📂 遞迴批次處理架構 (`--recursive`)
+- 系統自動掃描指定目錄下的所有 `*_銷文.md`，並尋找同目錄下的對應 `.txt` 經文檔。
+- 對每一組檔案執行完整的閉環狀態機校驗，**修至 100% 覆蓋率且 0 瑕疵後**自動進入下一檔案。
+- 每個檔案具備獨立日誌檔案（`[檔名]_銷文_review_log.txt`），根目錄同時產生全域摘要日誌 `batch_sutra_review.log`。
+
 ---
 
 ## ⚖️ 義理審查與科判放行準則
@@ -146,9 +176,10 @@ graph TD
 | 類別 | 審查規則 | 處理動作 |
 | :--- | :--- | :--- |
 | **字詞/專有名詞跨段腰斬** | 如前段末「阿彌陀」，後段首「佛」 | 通報合併修復 (`merge_indices: [i, i+1]`) |
-| **半偈殘篇** | 五言/七言韻文不足整偈（如單段僅 5/7/14 字） | 通報合併為整偈（4句 20/28 字） |
+| **半偈殘篇** | 五言/七言韻文不足整偈（如單段僅 5/7/14 字） | 通報合併為整偈（4 句 20/28 字） |
 | **條件/因果前綴懸空** | 僅有假設子句（如「若彼所生」），無主句成義 | 通報與下段合併 |
 | **單段過長臃腫** | 散文 >80~100 字且包含多個可獨立開示的法義句 | 通報拆分 (`type: 單段過長需拆分, merge_indices: [i]`) |
+| **開頭孤立標點/括號** | 原典開頭帶有 `）`、`]`、`，` 等殘肢 | **本地極速清洗修復（免 API、0 延遲）** |
 | **序號列舉條目** | 帶序號或法相標籤（如「一者、諦實故；」「二者...」） | **堅決放行（嚴禁合併或判定為碎片）** |
 | **設問徵起與精簡問答** | 「所以者何」、「何以故」、「王言：不也。」 | **堅決放行（合法獨立總標/問答）** |
 
@@ -183,7 +214,7 @@ graph TD
 ## ⚙️ 完整命令列參數清單
 
 ```text
-用法: sutra.py [-h] --file FILE [--output OUTPUT]
+用法: sutra.py [-h] [--file FILE] [--recursive [DIR]] [--output OUTPUT]
                 [--auto | --generate | --fix-gaps | --review | --fix]
                 [--dry-run] [--debug] [--model MODEL]
                 [--reasoning-effort {low,medium,high}]
@@ -191,8 +222,10 @@ graph TD
                 [--gemini] [--free-glm] [--opencode] [--zen]
                 [--base-url BASE_URL] [--api-key API_KEY] [--api-key-file PATH]
 
-必要參數:
-  --file FILE                  原始經文 txt 檔案路徑（UTF-8 編碼）
+輸入與批次模式:
+  --file FILE                  原始經文 txt 檔案路徑（單檔模式）
+  --recursive, --batch [DIR]   ★ 遞迴批次模式：搜尋指定目錄（預設為當前目錄 .），
+                               自動找出所有 *_銷文.md 匹配對應經文並逐一校驗完工
 
 模式選擇 (互斥，預設為 --auto):
   --auto                       ★ 啟動一鍵全自動閉環流水線（自動處理銷文、補漏、審查與修正）
@@ -237,7 +270,15 @@ graph TD
 > 不會。系統內建風格探測器（`detect_punctuation_style`），全句號文本會自動啟用寬鬆合併策略，允許語意自足的單元（包括「所以者何」、「王言：不也。」等徵起句與問答）獨立成段。
 
 ### Q4: 如何設定多把 API Key 突破 429 頻率限制？
-> 在金鑰文字檔（如 `gemini_key.txt`、`openrouter_key.txt` 或 `api_key.txt`）中**換行貼上多組 Key** 即可。系統自動建置金鑰池，遇到 429 或配額異常時將**在 2 秒內切換至下一把 Key 立即重試**。
+> 在金鑰文字檔（如 `gemini_key.txt`、`openrouter_key.txt` 或 `api_key.txt`）中**換行貼上多組 Key** 即可。系統自動建置金鑰池，遇到 429 限流將**在 1.5～2 秒內切換至下一把 Key 立即重試**；若遇到欠費或無效 Key 則會**自動剔除**，確保批次作業不中斷。
+
+### Q5: 批次模式下找不到對應的 `.txt` 原典怎麼辦？
+> 請確保經文 `.txt` 與 `_銷文.md` 位於同一目錄下。系統支援以下命名規則：
+> - `藥師經.txt` ➔ `藥師經_銷文.md`
+> - `金剛經_經文.txt` ➔ `金剛經_銷文.md`
+> - `心經_原典.txt` ➔ `心經_銷文.md`
+> 
+> 若發現孤兒銷文檔，系統會在終端機與日誌中給出警告提示，並自動跳過該檔案，不影響其餘檔案的處理。
 
 ---
 
