@@ -142,6 +142,9 @@ class ApiKeyPool:
         new_key = self.rotate()
         if hasattr(client, "api_key"):
             client.api_key = new_key
+        # 兼容部分 SDK 版本的 internal auth header
+        if hasattr(client, "_custom_headers") and isinstance(client._custom_headers, dict):
+            client._custom_headers["Authorization"] = f"Bearer {new_key}"
         logger.warning(
             f"    🔑 [金鑰輪換] {reason}，已自動切換至可用 Key ({self.mask_key(new_key)})"
         )
@@ -522,13 +525,24 @@ def request_and_validate_segment(
     dup_guide: str
 ) -> Tuple[Optional[str], Optional[str], bool]:
     """
-    執行單次單元銷文請求、清洗與格式品質校驗（具備動態重試修正反饋與配額耗盡快速中斷）。
+    執行單次單元銷文請求、清洗與格式品質校驗
+    （DeepSeek / OpenAI Prompt Cache 前綴極致鎖定版）
     回傳: (success_block, extracted_sent, should_terminate)
     """
     retry_feedback = ""
     norm_rem_len = len(normalize_text(remaining_text))
 
-    # ★ 義理導向動態切分指引（尊重 AI 自主裁量，無硬性字數門檻）
+    # 1. 靜態指引規範區塊（結構與文字絕對固定，鎖定快取前綴）
+    guideline_parts = []
+    if guideline_title:
+        guideline_parts.append(guideline_title)
+    if first_rule:
+        guideline_parts.append(first_rule)
+    if dup_guide:
+        guideline_parts.append(dup_guide)
+    guideline_section = ("\n".join(guideline_parts) + "\n\n") if guideline_parts else ""
+
+    # 2. 義理導向動態切分指引（去除動態字數數字，避免 Token Jitter 破壞快取）
     split_hint = ""
     if problem_desc and any(kw in problem_desc for kw in ["拆分", "過長", "切分", "堆疊"]):
         split_hint = (
@@ -539,19 +553,10 @@ def request_and_validate_segment(
         )
     elif norm_rem_len > 60:
         split_hint = (
-            f"💡【推進提醒】：當前待處理經文較長（共 {norm_rem_len} 字）。"
-            f"若內部包含多個獨立句讀或法相轉折，請僅截取開頭第一個自足單元銷文；"
-            f"若全段為不可分割之完整論證，則由你依義理自主決定最適篇幅。\n\n"
+            "💡【長文推進提醒】：當前待處理經文篇幅較長。"
+            "若內部包含多個獨立句讀或法相轉折，請僅截取開頭第一個自足單元銷文；"
+            "若全段為不可分割之完整論證，則由你依義理自主決定最適篇幅。\n\n"
         )
-
-    guideline_section = ""
-    if guideline_title or first_rule or dup_guide:
-        g_parts = [guideline_title] if guideline_title else []
-        if first_rule:
-            g_parts.append(first_rule)
-        if dup_guide:
-            g_parts.append(dup_guide)
-        guideline_section = "\n".join(g_parts) + "\n\n"
 
     pool = getattr(client, "key_pool", None)
     # 動態調整重試上限：多 Key 時確保每一把 Key 至少能輪流嘗試 2 遍
@@ -561,12 +566,15 @@ def request_and_validate_segment(
         problem_section = f"【本處病灶與修正建議】：\n{problem_desc}\n\n" if (problem_desc and not is_gap_mode) else ""
         feedback_section = f"\n【🚨 上一輪輸出未通過校驗，請依此指示修正】：\n{retry_feedback}\n" if retry_feedback else ""
 
+        # ★★★ Prompt Cache 最佳化構造：絕對靜態前綴（置頂） -> 動態推進變量（置底） ★★★
         user_msg = (
+            # ─── 區塊 A：絕對靜態前綴（全本經文 + 核心規範，100% 鎖定 Cache） ───
             f"【經典全本文脈背景】：\n{sutra_text}\n\n"
-            f"【前文脈絡錨點】：\n{prev_sentence if prev_sentence else '（經文起始段落）'}\n\n"
             f"{guideline_section}"
+            # ─── 區塊 B：動態上下文（每輪前移推進） ───
             f"{problem_section}"
             f"{split_hint}"
+            f"【前文脈絡錨點】：\n{prev_sentence if prev_sentence else '（經文起始段落）'}\n\n"
             f"【🚨 當前待銷文剩餘經文（請嚴格從第一個字開始）】：\n{remaining_text}"
             f"{feedback_section}"
         )
@@ -621,7 +629,7 @@ def request_and_validate_segment(
                     return "<!-- DELETE -->", None, True
                 retry_feedback = f"【格式不完整】：輸出缺少必要段落 {missing}，請務必完整輸出所有必備欄位。"
                 logger.warning(f"    ⚠️ [重試 {retry + 1}/{max_retries}] 格式缺少必要欄位：{missing}")
-                logger.warning(f"    🔍 [Gemini 實際輸出內容如下]：\n{'-'*60}\n{cleaned_reply}\n{'-'*60}")
+                logger.warning(f"    🔍 [模型實際輸出內容如下]：\n{'-'*60}\n{cleaned_reply}\n{'-'*60}")
                 time.sleep(1)
                 continue
 
@@ -3255,6 +3263,14 @@ def auto_output_path(input_file: str) -> str:
 
 
 def main():
+    # ★ Windows 控制台 UTF-8 編碼安全防禦
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（智慧閉環流水線版）"
     )
