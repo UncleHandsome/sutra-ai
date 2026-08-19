@@ -132,39 +132,14 @@ class ApiKeyPool:
         self.all_keys = [k.strip() for k in keys if k and k.strip()]
         self.active_keys = list(self.all_keys)
         self.current_idx = 0
-        self.last_cycle_start = time.time()
 
-    def next_key_for_request(
-        self,
-        client: Any,
-        logger: logging.Logger,
-        target_cooldown: float = 0.0
-    ) -> str:
-        """★ 每一個 Request 輪流切換至下一把 Key，並於繞回頭時依剩餘可用數量動態節流"""
+    def next_key_for_request(self, client: Any) -> str:
+        """★ 每一個 Request 輪流切換至下一把 Key"""
         if not self.active_keys:
             return ""
-
-        # 判斷是否即將繞回池首（到頭）
-        is_cycling_to_head = (self.current_idx + 1) >= len(self.active_keys)
-
-        # 輪轉至下一把 Key
         self.current_idx = (self.current_idx + 1) % len(self.active_keys)
         new_key = self.active_keys[self.current_idx]
         self._apply_key_to_client(client, new_key)
-
-        # 到頭時進行動態節流（剩餘可用 Key 越少，整輪耗時越短，需等待補足的冷卻時間越長）
-        if is_cycling_to_head and target_cooldown > 0:
-            now = time.time()
-            elapsed = now - self.last_cycle_start
-            wait_time = max(0.0, target_cooldown - elapsed)
-            if wait_time > 0:
-                logger.info(
-                    f"  ⏳ [金鑰輪轉到頭] 剩餘可用金鑰 {len(self.active_keys)} 把，"
-                    f"動態節流等待 {wait_time:.1f} 秒以冷卻金鑰..."
-                )
-                time.sleep(wait_time)
-            self.last_cycle_start = time.time()
-
         return new_key
 
     def get_current_key(self) -> str:
@@ -1660,30 +1635,22 @@ def stream_completion(
     else:
         max_tokens_val = 384000
 
-    # 1. 決定單把 Key 的目標安全冷卻間隔 (秒)
-    target_interval = 0.0
-    if is_third_party_or_free:
-        if "gemini" in model.lower() or "googleapis" in str(client.base_url).lower():
-            target_interval = 13.0 if ("pro" in model.lower()) else 5.2
-        elif "openrouter" in str(client.base_url).lower():
-            target_interval = 15.0  # 針對 OpenRouter 調高基礎安全冷卻時間
-        elif "nvidia" in str(client.base_url).lower():
-            target_interval = 10.0  # NVIDIA NIM 速度快且頻率限制寬鬆
-        else:
-            target_interval = 10.0
+    # 1. 時間間隔控制 (OpenRouter / NVIDIA / Gemini 每 6 秒，其餘每 2 秒)
+    url_and_model = f"{client.base_url} {model}".lower()
+    target_interval = 6.0 if any(kw in url_and_model for kw in ["openrouter", "nvidia", "gemini", "googleapis"]) else 2.0
 
-    # 2. 每一個 Request 輪流換下一把 Key，並於繞回頭時依剩餘可用數量動態節流
+    now = time.time()
+    elapsed = now - _LAST_API_CALL_TIME
+    if elapsed < target_interval:
+        wait_seconds = target_interval - elapsed
+        logger.info(f"  ⏳ [頻率管控] 距離上次請求間隔保護中，等待 {wait_seconds:.1f} 秒...")
+        time.sleep(wait_seconds)
+    _LAST_API_CALL_TIME = time.time()
+
+    # 2. 金鑰純輪換
     pool = getattr(client, "key_pool", None)
     if pool and len(pool.active_keys) > 0:
-        pool.next_key_for_request(client, logger, target_cooldown=target_interval)
-    elif is_third_party_or_free:
-        now = time.time()
-        elapsed = now - _LAST_API_CALL_TIME
-        if elapsed < target_interval:
-            wait_seconds = target_interval - elapsed
-            logger.info(f"  ⏳ [頻率管控] API 調用間隔保護中，等待 {wait_seconds:.1f} 秒...")
-            time.sleep(wait_seconds)
-        _LAST_API_CALL_TIME = time.time()
+        pool.next_key_for_request(client)
 
     create_kwargs = {
         "model": model,
