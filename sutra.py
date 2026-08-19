@@ -1648,7 +1648,7 @@ def stream_completion(
     if "dots" in m_lower:
         max_tokens_val = 512000
     elif "glm-5.2" in m_lower or "glm" in m_lower:
-        max_tokens_val = 256000
+        max_tokens_val = 15000
     elif "gemini" in m_lower or "googleapis" in str(client.base_url).lower():
         max_tokens_val = 65536
     elif is_third_party_or_free:
@@ -1687,6 +1687,7 @@ def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    is_gemini_endpoint = "gemini" in model.lower() or "googleapis" in str(client.base_url).lower()
     if is_gemini_endpoint:
         # ★ 關閉 Gemini 內建安全過濾器，防止佛經名相（貪愛、老死、非有非無）觸發攔截斷句
         create_kwargs["extra_body"] = {
@@ -2878,7 +2879,8 @@ def run_fix(
 ) -> bool:
     """依審查報告執行批次修正（回傳修復成功狀態）"""
     is_standalone_fix = (all_issues is None)
-    review_path, checkpoint_path, _ = get_auxiliary_paths(output_path)
+    review_path = os.path.splitext(output_path)[0] + "_review.json"
+    checkpoint_path = os.path.splitext(output_path)[0] + "_checkpoint.json"
 
     if all_issues is None:
         if not os.path.exists(review_path):
