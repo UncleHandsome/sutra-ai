@@ -1536,17 +1536,19 @@ def handle_api_exception(
     # 3. 一般限流（RPM）或網路短暫異常
     if pool and pool.has_multiple():
         pool.rotate_client(client, logger, reason=f"API 請求異常 ({e})")
-        backoff_time = 1.5
+        backoff_time = 3.0
     else:
         is_free_or_rate_limit = (
             ":free" in model.lower()
             or "openrouter" in str(client.base_url).lower()
             or "googleapis" in str(client.base_url).lower()
+            or "nvidia" in str(client.base_url).lower()
             or "429" in err_msg
             or "rate" in err_msg.lower()
             or "quota" in err_msg.lower()
         )
-        backoff_time = min(45, (retry + 1) * 15) if is_free_or_rate_limit else (retry + 1) * 3
+        # 大幅調高免費端點與 OpenRouter 的退避時間 (最高 120 秒)
+        backoff_time = min(120, (retry + 1) * 30) if is_free_or_rate_limit else (retry + 1) * 5
 
     desc_str = f"（{context_desc}）" if context_desc else ""
     logger.error(
@@ -1647,8 +1649,10 @@ def stream_completion(
     m_lower = model.lower()
     if "dots" in m_lower:
         max_tokens_val = 512000
+    elif "nvidia" in str(client.base_url).lower():
+        max_tokens_val = 16384  # NVIDIA NIM 輸出上限規格
     elif "glm-5.2" in m_lower or "glm" in m_lower:
-        max_tokens_val = 15000
+        max_tokens_val = 150000
     elif "gemini" in m_lower or "googleapis" in str(client.base_url).lower():
         max_tokens_val = 65536
     elif is_third_party_or_free:
@@ -1661,8 +1665,12 @@ def stream_completion(
     if is_third_party_or_free:
         if "gemini" in model.lower() or "googleapis" in str(client.base_url).lower():
             target_interval = 13.0 if ("pro" in model.lower()) else 5.2
+        elif "openrouter" in str(client.base_url).lower():
+            target_interval = 15.0  # 針對 OpenRouter 調高基礎安全冷卻時間
+        elif "nvidia" in str(client.base_url).lower():
+            target_interval = 10.0  # NVIDIA NIM 速度快且頻率限制寬鬆
         else:
-            target_interval = 6.0
+            target_interval = 10.0
 
     # 2. 每一個 Request 輪流換下一把 Key，並於繞回頭時依剩餘可用數量動態節流
     pool = getattr(client, "key_pool", None)
@@ -3448,7 +3456,8 @@ def load_api_keys(
     api_key_str: Optional[str] = None,
     is_opencode: bool = False,
     is_free_glm: bool = False,
-    is_gemini: bool = False
+    is_gemini: bool = False,
+    is_nvidia: bool = False
 ) -> Optional[ApiKeyPool]:
     """讀取多 API Key 並構建 ApiKeyPool（支援多行、註解、逗號分隔）"""
     keys: List[str] = []
@@ -3472,6 +3481,8 @@ def load_api_keys(
     if not keys:
         if is_gemini:
             env_candidates = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
+        elif is_nvidia:
+            env_candidates = ["NVIDIA_API_KEY", "NV_API_KEY", "OPENAI_API_KEY"]
         elif is_free_glm:
             env_candidates = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
         elif is_opencode:
@@ -3492,11 +3503,12 @@ def load_api_keys(
         base_dir = os.path.dirname(os.path.abspath(__file__))
         file_map = {
             "gemini": ["gemini_key.txt", "google_key.txt", "gemini_api_key.txt", "api_key.txt"],
+            "nvidia": ["nvidia_key.txt", "nvidia_api_key.txt", "nv_key.txt", "api_key.txt"],
             "free_glm": ["openrouter_key.txt", "openrouter_api_key.txt", "glm_key.txt", "api_key.txt"],
             "opencode": ["opencode_key.txt", "opencode_api_key.txt", "api_key.txt"],
             "deepseek": ["api_key.txt", "deepseek_key.txt", "deepseek_api_key.txt", "key.txt"],
         }
-        category = "gemini" if is_gemini else ("free_glm" if is_free_glm else ("opencode" if is_opencode else "deepseek"))
+        category = "gemini" if is_gemini else ("nvidia" if is_nvidia else ("free_glm" if is_free_glm else ("opencode" if is_opencode else "deepseek")))
         candidate_filenames = file_map[category]
 
         cwd_dir = os.getcwd()
@@ -3552,6 +3564,11 @@ PROVIDER_DEFAULTS = {
         "default_model": "z-ai/glm-5.2:free",
         "name": "OpenRouter Free GLM",
     },
+    "nvidia": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "default_model": "z-ai/glm-5.2",
+        "name": "NVIDIA NIM GLM-5.2 (build.nvidia.com)",
+    },
     "opencode": {
         "base_url": "https://opencode.ai/zen/go/v1",
         "default_model": "deepseek-v4-flash",
@@ -3592,6 +3609,7 @@ def main():
     provider_group = parser.add_mutually_exclusive_group()
     provider_group.add_argument("--deepseek", action="store_const", dest="provider", const="deepseek", help="使用 DeepSeek 官方 API")
     provider_group.add_argument("--gemini", "--google", action="store_const", dest="provider", const="gemini", help="★ 使用 Google AI Studio Gemini 免費端點")
+    provider_group.add_argument("--nvidia", "--nim", action="store_const", dest="provider", const="nvidia", help="★ 使用 NVIDIA NIM (build.nvidia.com) GLM-5.2 端點")
     provider_group.add_argument("--free-glm", "--glm5", "--glm", action="store_const", dest="provider", const="free_glm", help="★ 使用 OpenRouter Free GLM 免費模型端點")
     provider_group.add_argument("--opencode", "--go", action="store_const", dest="provider", const="opencode", help="★ 使用 OpenCode Go 訂閱端點")
     provider_group.add_argument("--zen", action="store_const", dest="provider", const="zen", help="使用 OpenCode Zen 按量計費端點")
@@ -3644,7 +3662,8 @@ def main():
         api_key_str=args.api_key,
         is_opencode=(args.provider in ["opencode", "zen"]),
         is_free_glm=(args.provider == "free_glm"),
-        is_gemini=(args.provider == "gemini")
+        is_gemini=(args.provider == "gemini"),
+        is_nvidia=(args.provider == "nvidia")
     )
     if not key_pool:
         return
