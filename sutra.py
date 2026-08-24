@@ -107,7 +107,18 @@ class ReviewIssue:
         idx_val = int(raw_idx) if (isinstance(raw_idx, (int, str)) and str(raw_idx).isdigit()) else 0
         raw_m = data.get("merge_indices")
         merge_indices = []
-        if isinstance(raw_m, list) and raw_m:
+        if isinstance(raw_m, (int, str)):
+            raw_str = str(raw_m).strip()
+            if re.search(r"[-~至到]", raw_str):
+                parts = [p.strip() for p in re.split(r"[-~至到]", raw_str) if p.strip().isdigit()]
+                if len(parts) == 2:
+                    start_i, end_i = int(parts[0]), int(parts[1])
+                    merge_indices = list(range(min(start_i, end_i), max(start_i, end_i) + 1))
+            elif re.search(r"[,、，及與和\s]", raw_str):
+                merge_indices = [int(p) for p in re.split(r"[,、，及與和\s]+", raw_str) if p.isdigit()]
+            elif raw_str.isdigit():
+                merge_indices = [int(raw_str)]
+        elif isinstance(raw_m, list) and raw_m:
             for i in raw_m:
                 if isinstance(i, int):
                     merge_indices.append(i)
@@ -122,7 +133,6 @@ class ReviewIssue:
             position=data.get("position"),
         )
 
-
 # ============================================================
 #  一、多金鑰輪換池管理器 (API Key Pool)
 # ============================================================
@@ -132,13 +142,32 @@ class ApiKeyPool:
         self.all_keys = [k.strip() for k in keys if k and k.strip()]
         self.active_keys = list(self.all_keys)
         self.current_idx = 0
+        self.last_used: Dict[str, float] = {k: 0.0 for k in self.all_keys}
 
-    def next_key_for_request(self, client: Any) -> str:
-        """★ 每一個 Request 輪流切換至下一把 Key"""
+    def next_key_for_request(
+        self,
+        client: Any,
+        logger: Optional[logging.Logger] = None,
+        target_cooldown: float = 0.0
+    ) -> str:
+        """★ 每一個 Request 輪流切換至下一把 Key，並對該 Key 進行獨立冷卻控制"""
         if not self.active_keys:
             return ""
         self.current_idx = (self.current_idx + 1) % len(self.active_keys)
         new_key = self.active_keys[self.current_idx]
+
+        # 獨立 Key 冷卻控制（避免單把 Key 短時間內打滿 RPM）
+        if target_cooldown > 0.0:
+            last_time = self.last_used.get(new_key, 0.0)
+            now = time.time()
+            elapsed = now - last_time
+            if elapsed < target_cooldown:
+                wait_sec = target_cooldown - elapsed
+                if logger:
+                    logger.info(f"  ⏳ [金鑰冷卻] Key ({self.mask_key(new_key)}) 冷卻保護中，等待 {wait_sec:.1f} 秒...")
+                time.sleep(wait_sec)
+
+        self.last_used[new_key] = time.time()
         self._apply_key_to_client(client, new_key)
         return new_key
 
@@ -155,18 +184,24 @@ class ApiKeyPool:
         return self.active_keys[self.current_idx]
 
     def _apply_key_to_client(self, client: Any, key: str) -> None:
-        """深層穿透更新 OpenAI Client 實例的 API Key 與授權 Header"""
+        """深層穿透更新 OpenAI Client 實例的 API Key、default_headers 與底層 httpx 授權"""
         if hasattr(client, "api_key"):
             client.api_key = key
-        # 同步更新自訂 Header 與 httpx 內部 Header（避免大小寫重複設置導致 Cloudflare 400 Bad Request）
+        # 同步更新 OpenAI SDK v1.x 的 default_headers
+        if hasattr(client, "default_headers") and isinstance(client.default_headers, dict):
+            client.default_headers["Authorization"] = f"Bearer {key}"
+            client.default_headers.pop("authorization", None)
+        # 同步更新自訂 Header 與 httpx 內部 Header
         if hasattr(client, "_custom_headers") and isinstance(client._custom_headers, dict):
             client._custom_headers["Authorization"] = f"Bearer {key}"
             client._custom_headers.pop("authorization", None)
-        # 兼容最新 OpenAI Python SDK 內部 Client 配置
         if hasattr(client, "_client"):
             try:
                 if hasattr(client._client, "headers"):
                     client._client.headers["Authorization"] = f"Bearer {key}"
+                    client._client.headers.pop("authorization", None)
+                if hasattr(client._client, "default_headers") and isinstance(client._client.default_headers, dict):
+                    client._client.default_headers["Authorization"] = f"Bearer {key}"
             except Exception:
                 pass
         if hasattr(client, "_auth") and hasattr(client._auth, "token"):
@@ -239,10 +274,10 @@ RE_THINK_TAG = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 RE_CODE_FENCE_OPEN = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*\n?", re.MULTILINE)
 RE_CODE_FENCE_CLOSE = re.compile(r"\n?\s*```\s*$", re.MULTILINE)
 
-# ★ 全域統一 Markdown 段落切分正則（支援 #、*、> 等前綴修飾與原典標籤）
+# ★ 全域統一 Markdown 段落切分正則（嚴格錨定行首標題結構與冒號/引號/閉括號，防止正文引用誤切斷）
 SECTION_SPLIT_REGEX = re.compile(
     r"(?:\n\s*---\s*\n|(?<=\n)(?=(?:[\s#*`>]*【當前經文進度】|"
-    r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*)[\s*`>]*原典)))"
+    r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*)[\s*`>]*原典[\s*`_】\]\)]*[：:「『\"'“\n])))"
 )
 
 # 統一古異體字至標準通行字（單向歸一化至大藏經通行正體字）
@@ -349,15 +384,12 @@ def clean_markdown_content(raw_content: str) -> str:
         return ""
     text = raw_content.strip()
 
-    # 0. 移除 DeepSeek R1 / 推理模型閉合與未閉合的思維鏈（包含遺漏開頭標籤的情況）
+    # 0. 徹底移除各類推理模型（DeepSeek, Qwen, GLM, Claude 等）的思維鏈區塊
     text = RE_THINK_TAG.sub("", text).strip()
-    if "<think>" in text.lower():
-        text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.IGNORECASE).strip()
-    elif "</think>" in text.lower():
-        text = re.sub(r"^[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
-
-    # 移除部分模型輸出的思考前綴標籤
-    text = re.sub(r"^:::+\s*thought[\s\S]*?:::+\s*", "", text, flags=re.IGNORECASE).strip()
+    # 清理 <think>, <thought>, <reasoning> 各類閉合與未閉合思考標籤
+    text = re.sub(r"<(?:think|thought|reasoning)>[\s\S]*?(?:</(?:think|thought|reasoning)>|$)", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^[\s\S]*?</(?:think|thought|reasoning)>", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^:::+\s*(?:thought|reasoning)[\s\S]*?:::+\s*", "", text, flags=re.IGNORECASE).strip()
 
     # 0.5 優先移除外層 Markdown 程式碼區塊標記（確保後續 ^ 錨點匹配正常）
     text = RE_CODE_FENCE_OPEN.sub("", text).strip()
@@ -449,13 +481,14 @@ def is_ignorable_gap(gap_text: str) -> bool:
     if not clean:
         return True
 
-    # 1. 嚴格品題、卷次結構與獨立經名/論名
+    # 1. 嚴格品題、卷次結構與獨立經名/論名（排除包含「受持/當知/名為」等正文動詞）
     strict_title_patterns = [
         r"^.*?[經論律]\s*(?:卷|品|章|分)(?:第[一二三四五六七八九十百千\d]+)?(?:之[一二三四五六七八九十\d初末餘之]+)?$",
         r"^.*?(?:品第|卷第|分第)[一二三四五六七八九十百千\d]+$",
         r"^第[一二三四五六七八九十百千\d]+[品卷章分](?:之[一二三四五六七八九十\d]+)?$",
         r"^.*?經卷(?:第?[一二三四五六七八九十百千\d]+)?$",
-        r"^(?:佛說)?[^，。！？；、：\s]{2,25}[經論律]$",
+        # 移除寫死經名，通用支援 2~30 字無句讀之獨立經/論/律/品題名
+        r"^[^，。！？；、：—…\n]{2,30}(?:經|論|律|疏|科判|義貫)(?:第[一二三四五六七八九十\d]+)?$",
     ]
 
     # 2. 常見三藏譯師署名與經首序文題記（嚴格錨定朝代/譯師公式，避免誤殺『法師/說/集』等經文正文）
@@ -540,7 +573,10 @@ def verify_sentence_quality(
             pass  # AI 稍帶前導詞，放行
         elif match_pos > 0:
             skipped_chars = clean_rem[:match_pos]
-            if is_dup_context:
+            # 通用辨識：大藏經冊頁號 (001a01)、版勘標籤 (宋元明磧砂宮高麗等)、中文序號
+            editorial_pat = r"^(?:[0-9a-zA-Z_]+|[一二三四五六七八九十百千甲乙丙丁]+|宋|元|明|清|磧砂|高麗|宮|聖|藏|大正|嘉興|磧)+$"
+            is_editorial_marker = (len(skipped_chars) <= 15 and bool(re.match(editorial_pat, skipped_chars)))
+            if is_dup_context or is_editorial_marker:
                 pass
             else:
                 raw_skipped = remaining_text[: min(len(skipped_chars) + 15, len(remaining_text))].strip()
@@ -785,13 +821,12 @@ def get_sutra_coverage(sutra_text: str, completed_sentences: List[str]) -> Tuple
             continue
 
         best_pos = -1
-        max_new_cover = -1
+        max_score = float("-inf")
         best_distance = float("inf")
         expected_pos = int((orig_idx / max(1, len(completed_sentences))) * n)
 
         for pos in matches:
             end_pos = min(pos + len(s_norm), n)
-            # ★ 若使用前綴降級匹配，必須核驗區間內的文字相似度，防止將數十個不相關字元誤塗黑
             if is_prefix_fallback and len(s_norm) > 0:
                 target_window = norm_sutra[pos:end_pos]
                 matching_chars = sum(1 for a, b in zip(s_norm, target_window) if a == b)
@@ -800,16 +835,18 @@ def get_sutra_coverage(sutra_text: str, completed_sentences: List[str]) -> Tuple
 
             new_cover = sum(1 for i in range(pos, end_pos) if not covered_mask[i])
             dist = abs(pos - expected_pos)
-            if new_cover > max_new_cover or (new_cover == max_new_cover and dist < best_distance):
-                max_new_cover = new_cover
+            # 綜合評分：新覆蓋字數獎勵 - 超遠距離偏差懲罰
+            dist_penalty = (dist / max(1, n)) * 15.0
+            score = new_cover - dist_penalty
+            if score > max_score or (score == max_score and dist < best_distance):
+                max_score = score
                 best_distance = dist
                 best_pos = pos
 
         if best_pos != -1:
             end_pos = min(best_pos + len(s_norm), n)
-            if max_new_cover > 0:
-                for i in range(best_pos, end_pos):
-                    covered_mask[i] = True
+            for i in range(best_pos, end_pos):
+                covered_mask[i] = True
             sentence_slots[orig_idx] = (best_pos, end_pos)
 
     return clean_to_raw_map, norm_sutra, covered_mask, sentence_slots
@@ -1049,15 +1086,22 @@ def find_best_position(raw_target: str, section_text: Optional[str], clean_sutra
         context_window = norm_sutra[win_start:win_end]
 
         score = 0
+        dist = abs(pos - last_pos)
+        # 連續性加權：窗口大小自適應為當前目標字數的 1.5 倍（至少 50 字，最大 200 字）
+        continuity_window = max(50, min(200, int(len(norm_target) * 1.5)))
+        if last_pos > 0 and 0 <= (pos - last_pos) <= continuity_window:
+            score += 50.0
+
         if len(sec_norm) > len(norm_target) + 6:
             for i in range(0, len(context_window) - 2):
                 if context_window[i : i + 3] in sec_norm:
                     score += 1
-            score -= (abs(pos - last_pos) / 100.0)
+            # 加重超遠距離懲罰（防止常見名相干擾導致跨章節飛躍）
+            score -= (dist / 25.0)
         else:
-            score = -abs(pos - last_pos)
+            score = -dist
 
-        if score > max_score or (score == max_score and abs(pos - last_pos) < abs(best_pos - last_pos)):
+        if score > max_score or (score == max_score and dist < abs(best_pos - last_pos)):
             max_score = score
             best_pos = pos
 
@@ -1184,13 +1228,17 @@ def parse_md_sections(filepath: str) -> Tuple[str, List[str]]:
         header = m.group(1)
         content = content[len(m.group(1)):]
 
-    # 統一使用全域切分正則
     raw_blocks = [
         s.strip()
         for s in SECTION_SPLIT_REGEX.split(content)
         if s.strip() and s.strip() != "---"
     ]
     raw_sections = [b for b in raw_blocks if not (b.startswith("#") and "佛經銷文" in b and len(b) < 120)]
+
+    invalid_tokens = {"無", "（無）", "(無)", "none", "null", ""}
+    def _is_valid_section(blk: str) -> bool:
+        sent = extract_sentence(blk)
+        return bool(sent and sent not in invalid_tokens and len(normalize_text(sent)) >= 1)
 
     sections = []
     for b in raw_sections:
@@ -1200,17 +1248,16 @@ def parse_md_sections(filepath: str) -> Tuple[str, List[str]]:
             b
         )
         if not sections:
-            if extract_sentence(b):
+            if _is_valid_section(b):
                 sections.append(b)
             else:
                 header = (header.strip() + "\n\n" + b).strip() + "\n\n"
         else:
-            if not extract_sentence(b):
+            if not _is_valid_section(b):
                 sections[-1] += "\n\n" + b
             else:
                 sections.append(b)
     return header, sections
-
 
 def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
     """依據全域槽位覆蓋進行經文物理重排與安全去重"""
@@ -1220,8 +1267,12 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
 
     header = ""
     content_body = md_content.strip()
-    title_match = re.match(r"^(#{1,6}\s+[^\n]+\n+)", content_body)
-    if title_match:
+    # 完整截取直到第一個 --- 分隔線或第一個原典段落前的所有標題與前導文字
+    first_split = SECTION_SPLIT_REGEX.search(content_body)
+    if first_split and not extract_sentence(content_body[:first_split.start()]):
+        header = content_body[:first_split.start()].strip()
+        content_body = content_body[first_split.end():].strip()
+    elif title_match := re.match(r"^(#{1,6}\s+[^\n]+(?:\n+[>*\s\w\u4e00-\u9fa5（\(\[【〔<《〈][^\n]*)*\n*)", content_body):
         header = title_match.group(1).strip()
         content_body = content_body[len(title_match.group(1)):].strip()
 
@@ -1344,22 +1395,12 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
 
     unique_secs = []
     seen_sec_hashes = set()
-    seen_pos_sentences = set()
     for item in assigned_sections:
         sec_clean_norm = normalize_text(item["sec"])
         sec_hash = hash(sec_clean_norm) if sec_clean_norm else hash(item["sec"].strip())
-        
-        norm_s = item.get("norm_s") or normalize_text(extract_sentence(item.get("sec", "")) or "")
         pos = item["pos"]
 
-        # 單一位置重複句判定（依據 pos 槽位與規範化文字精確去重，跨位置重複句 pos 不同會安全保留）
-        if norm_s:
-            pos_key = (pos, norm_s)
-            if pos_key in seen_pos_sentences:
-                continue
-            seen_pos_sentences.add(pos_key)
-
-        # 結合位置與內容 Hash，避免跨品目相同偈頌/標題被誤殺剔除
+        # ★ 安全去重準則：僅當同槽位且「整段銷文內容完全一致」時才去重，保護連續出現的相同經句獨立銷文
         sec_pos_key = (pos, sec_hash)
         if sec_pos_key not in seen_sec_hashes:
             seen_sec_hashes.add(sec_pos_key)
@@ -1397,11 +1438,10 @@ def update_md_file(
                 if not norm_target:
                     continue
 
-                # 優先全域特徵比對，避免依賴易位移的局部搜尋窗口
+                # 優先在目標原始索引周圍尋找，加入距離懲罰，防止同名定型句跳回卷首
                 best_sec_idx = -1
-                best_match_score = -1
+                min_dist_score = float('inf')
                 for sec_idx, sec_text in enumerate(sections):
-                    # 已被前一個 merge index 鎖定的段落不可重複匹配
                     if sec_idx in target_indices_in_sections:
                         continue
 
@@ -1410,14 +1450,18 @@ def update_md_file(
                     if not sec_norm:
                         continue
 
-                    # 精確匹配或高度包含判定
+                    # 動態距離閾值：依總段落數自適應（最小 15 段，最大不超過 10% 總段數）
+                    max_allowed_dist = max(15, len(sections) // 10)
+                    dist = abs(sec_idx - orig_i)
                     if norm_target == sec_norm:
-                        best_sec_idx = sec_idx
-                        break
-                    elif norm_target in sec_norm or sec_norm in norm_target:
-                        overlap = min(len(norm_target), len(sec_norm))
-                        if overlap > best_match_score:
-                            best_match_score = overlap
+                        score = dist
+                        if score < min_dist_score:
+                            min_dist_score = score
+                            best_sec_idx = sec_idx
+                    elif (norm_target in sec_norm or sec_norm in norm_target) and dist <= max_allowed_dist:
+                        score = dist + 50
+                        if score < min_dist_score:
+                            min_dist_score = score
                             best_sec_idx = sec_idx
 
                 if best_sec_idx != -1 and best_sec_idx not in target_indices_in_sections:
@@ -1508,22 +1552,36 @@ def handle_api_exception(
             logger.error(f"❌ API 金鑰無效或帳號餘額不足 ({err_msg})！流水線立即中止。")
             return True, 0.0
 
-    # 3. 一般限流（RPM）或網路短暫異常
-    if pool and pool.has_multiple():
-        pool.rotate_client(client, logger, reason=f"API 請求異常 ({e})")
-        backoff_time = 3.0
+    # 3. 嘗試從錯誤訊息中提取官方建議等待秒數 (支援 OpenRouter / Google)
+    retry_delay = 0.0
+    m_retry = re.search(r"(?:retry_after_seconds['\"]?:\s*|retry in\s+|retryDelay['\"]?:\s*['\"]?)(\d+(?:\.\d+)?)", err_msg, re.IGNORECASE)
+    if m_retry:
+        try:
+            retry_delay = float(m_retry.group(1))
+        except Exception:
+            pass
+
+    # 4. 限流（429 / RESOURCE_EXHAUSTED / 配額限制）或網路異常：輪換 Key 並智慧退避
+    if pool is not None and pool.has_multiple():
+        pool.rotate_client(client, logger, reason="觸發頻率限制 (429/RPM)")
+        if retry_delay > 0:
+            backoff_time = max(retry_delay + 2.0, 6.0)
+        else:
+            backoff_time = min(30.0, (retry + 1) * 6.0)
     else:
-        is_free_or_rate_limit = (
-            ":free" in model.lower()
-            or "openrouter" in str(client.base_url).lower()
-            or "googleapis" in str(client.base_url).lower()
-            or "nvidia" in str(client.base_url).lower()
-            or "429" in err_msg
-            or "rate" in err_msg.lower()
-            or "quota" in err_msg.lower()
-        )
-        # 大幅調高免費端點與 OpenRouter 的退避時間 (最高 120 秒)
-        backoff_time = min(120, (retry + 1) * 30) if is_free_or_rate_limit else (retry + 1) * 5
+        if retry_delay > 0:
+            backoff_time = max(retry_delay + 3.0, 8.0)
+        else:
+            is_free_or_rate_limit = (
+                ":free" in model.lower()
+                or "openrouter" in str(client.base_url).lower()
+                or "googleapis" in str(client.base_url).lower()
+                or "nvidia" in str(client.base_url).lower()
+                or "429" in err_msg
+                or "rate" in err_msg.lower()
+                or "quota" in err_msg.lower()
+            )
+            backoff_time = min(120.0, (retry + 1) * 15.0) if is_free_or_rate_limit else min(30.0, (retry + 1) * 5.0)
 
     desc_str = f"（{context_desc}）" if context_desc else ""
     logger.error(
@@ -1571,12 +1629,32 @@ def parse_review_json_response(raw_text: str, max_idx: int) -> List[ReviewIssue]
     elif isinstance(parsed, list):
         issues_raw = parsed
 
-    # 轉換並過濾非法/越界索引
+    # 轉換並過濾非法/越界索引（深度防禦字串拆字 Bug）
     valid_issues: List[ReviewIssue] = []
     for raw_iss in issues_raw:
         if not isinstance(raw_iss, dict):
             continue
-        raw_merge = raw_iss.get("merge_indices") or [raw_iss.get("index", -1)]
+        raw_merge = raw_iss.get("merge_indices")
+        if raw_merge is None:
+            raw_merge = [raw_iss.get("index", -1)]
+        elif isinstance(raw_merge, (int, str)):
+            raw_str = str(raw_merge).strip()
+            # 支援中英文範圍符：- ~ 至 到 -> 轉換為連續整數 list
+            if re.search(r"[-~至到]", raw_str):
+                parts = [p.strip() for p in re.split(r"[-~至到]", raw_str) if p.strip().isdigit()]
+                if len(parts) == 2:
+                    start_i, end_i = int(parts[0]), int(parts[1])
+                    raw_merge = list(range(min(start_i, end_i), max(start_i, end_i) + 1))
+                else:
+                    raw_merge = [int(parts[0])] if parts else [-1]
+            # 支援中英文枚舉分隔符：, 、 及 與 和 空格
+            elif re.search(r"[,、，及與和\s]", raw_str):
+                raw_merge = [int(p) for p in re.split(r"[,、，及與和\s]+", raw_str) if p.isdigit()]
+            elif raw_str.isdigit():
+                raw_merge = [int(raw_str)]
+            else:
+                raw_merge = [-1]
+
         filtered_merge = []
         for idx in raw_merge:
             if isinstance(idx, int) and 0 <= idx <= max_idx:
@@ -1607,10 +1685,9 @@ def stream_completion(
     logger: logging.Logger,
     action_name: str = "LLM 呼叫"
 ) -> str:
-    """封裝串流 LLM 呼叫，具備 Token 上限校準、思考心跳與自動降級機制"""
+    """封裝串流 LLM 呼叫：全平台強制開啟深度思考 (Thinking / Reasoning)"""
     global _LAST_API_CALL_TIME
 
-    # OpenRouter / GLM / Gemini 等第三方免費模型單次上限適配，DeepSeek 官方則可設較大
     is_third_party_or_free = (
         ":free" in model.lower()
         or "glm" in model.lower()
@@ -1620,38 +1697,48 @@ def stream_completion(
         or "googleapis" in str(client.base_url).lower()
     )
 
-    # 精準適配各模型最大輸出 Token 規格
+    # 1. 精準適配各模型最大輸出 Token 規格 (全部檔位拉至極限 MAX)
     m_lower = model.lower()
     if "dots" in m_lower:
         max_tokens_val = 512000
-    elif "nvidia" in str(client.base_url).lower():
-        max_tokens_val = 16384  # NVIDIA NIM 輸出上限規格
+    elif "nvidia" in str(getattr(client, "base_url", "")).lower():
+        max_tokens_val = 16384
     elif "glm-5.2" in m_lower or "glm" in m_lower:
         max_tokens_val = 150000
-    elif "gemini" in m_lower or "googleapis" in str(client.base_url).lower():
+    elif "muse" in m_lower or "spark" in m_lower:
+        max_tokens_val = 256000
+    elif "ox" in m_lower or "preview" in m_lower or "alpha" in m_lower:
+        max_tokens_val = 131072
+    elif "gemini" in m_lower or "googleapis" in str(getattr(client, "base_url", "")).lower():
         max_tokens_val = 65536
     elif is_third_party_or_free:
         max_tokens_val = 65536
     else:
         max_tokens_val = 384000
 
-    # 1. 時間間隔控制 (OpenRouter / NVIDIA / Gemini 每 6 秒，其餘每 2 秒)
-    url_and_model = f"{client.base_url} {model}".lower()
-    target_interval = 6.0 if any(kw in url_and_model for kw in ["openrouter", "nvidia", "gemini", "googleapis"]) else 2.0
+    # 2. 頻率與冷卻控制
+    target_interval = 0.0
+    if is_third_party_or_free:
+        if "gemini" in model.lower() or "googleapis" in str(client.base_url).lower():
+            target_interval = 13.0 if ("pro" in model.lower()) else 5.2
+        elif "openrouter" in str(client.base_url).lower():
+            target_interval = 15.0
+        else:
+            target_interval = 10.0
 
-    now = time.time()
-    elapsed = now - _LAST_API_CALL_TIME
-    if elapsed < target_interval:
-        wait_seconds = target_interval - elapsed
-        logger.info(f"  ⏳ [頻率管控] 距離上次請求間隔保護中，等待 {wait_seconds:.1f} 秒...")
-        time.sleep(wait_seconds)
-    _LAST_API_CALL_TIME = time.time()
-
-    # 2. 金鑰純輪換
     pool = getattr(client, "key_pool", None)
     if pool and len(pool.active_keys) > 0:
-        pool.next_key_for_request(client)
+        pool.next_key_for_request(client, logger, target_cooldown=target_interval)
+    elif is_third_party_or_free:
+        now = time.time()
+        elapsed = now - _LAST_API_CALL_TIME
+        if elapsed < target_interval:
+            wait_seconds = target_interval - elapsed
+            logger.info(f"  ⏳ [頻率管控] API 調用間隔保護中，等待 {wait_seconds:.1f} 秒...")
+            time.sleep(wait_seconds)
+        _LAST_API_CALL_TIME = time.time()
 
+    # 3. 基礎請求參數
     create_kwargs = {
         "model": model,
         "messages": [
@@ -1662,9 +1749,16 @@ def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    is_gemini_endpoint = "gemini" in model.lower() or "googleapis" in str(client.base_url).lower()
-    if is_gemini_endpoint:
-        # ★ 關閉 Gemini 內建安全過濾器，防止佛經名相（貪愛、老死、非有非無）觸發攔截斷句
+
+    # ============================================================
+    # ★★★ 全平台強制開啟深度思考 (Thinking Mode) 智慧適配 ★★★
+    # ============================================================
+    effort_val = reasoning_effort or "high"
+    base_url_str = str(client.base_url).lower()
+
+    if "googleapis" in base_url_str or "gemini" in m_lower:
+        # 🟢 1. Google Gemini：開啟思考 (reasoning_effort) + 關閉安全攔截
+        create_kwargs["reasoning_effort"] = effort_val
         create_kwargs["extra_body"] = {
             "safety_settings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -1673,36 +1767,50 @@ def stream_completion(
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
         }
-    elif reasoning_effort and not is_third_party_or_free:
+    elif "openrouter" in base_url_str:
+        # 🟢 2. OpenRouter (GLM-5 / Qwen / Claude 等)：使用 OpenRouter 標準 reasoning 格式 (強制 Max 思考)
+        create_kwargs["extra_body"] = {
+            "reasoning": {
+                "effort": "max" if effort_val in ["high", "max"] else effort_val,
+                "exclude": False
+            }
+        }
+    else:
+        # 🟢 3. DeepSeek 官方 / OpenCode / Zen / NVIDIA NIM：雙通道思考拉至最高檔位
+        create_kwargs["reasoning_effort"] = effort_val
         create_kwargs["extra_body"] = {
             "thinking": {"type": "enabled"},
-            "reasoning_effort": reasoning_effort,
+            "reasoning": {"effort": "max"},
+            "reasoning_effort": "max" if effort_val in ["high", "max"] else effort_val,
         }
 
+    # 4. 發送請求與智慧降級保護（若特定端點報錯則自動平滑降級）
     try:
         resp = client.chat.completions.create(**create_kwargs)
     except Exception as api_err:
         err_str = str(api_err).lower()
-        # 0. 針對 OpenRouter/GLM 之 max_tokens 過大報錯降級
+        # 降級處理 1: max_tokens 過大
         if "max_tokens" in err_str or "maximum allowed" in err_str:
             create_kwargs["max_tokens"] = 4096
-        # 1. 降級去除 extra_body (thinking 參數)
-        if "extra_body" in create_kwargs and ("extra_body" in err_str or "unrecognized" in err_str or "thinking" in err_str):
+        # 降級處理 2: 某些舊模型不支援 reasoning_effort 或 extra_body
+        if "reasoning_effort" in err_str or "extra_body" in err_str or "unrecognized" in err_str:
+            create_kwargs.pop("reasoning_effort", None)
             create_kwargs.pop("extra_body", None)
-        # 2. 降級去除 stream_options (部分反向代理不支援)
-        if "stream_options" in err_str or "stream_options" in str(api_err):
+        # 降級處理 3: 移除 stream_options
+        if "stream_options" in err_str:
             create_kwargs.pop("stream_options", None)
 
         try:
             resp = client.chat.completions.create(**create_kwargs)
         except Exception as e2:
-            # 二次安全降級：同時去除 stream_options 與 extra_body
+            create_kwargs.pop("reasoning_effort", None)
             create_kwargs.pop("extra_body", None)
             create_kwargs.pop("stream_options", None)
             if "max_tokens" in str(e2).lower():
                 create_kwargs["max_tokens"] = 4096
             resp = client.chat.completions.create(**create_kwargs)
 
+    # 5. 串流接收與思考心跳即時反饋
     content_parts = []
     last_chunk = None
     captured_usage = None
@@ -1724,7 +1832,6 @@ def stream_completion(
             if not delta:
                 continue
 
-            # 兼容 delta 為物件或字典結構
             if isinstance(delta, dict):
                 content_val = delta.get("content")
                 reasoning_val = delta.get("reasoning_content") or delta.get("reasoning")
@@ -1736,10 +1843,10 @@ def stream_completion(
                     or (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
                 )
 
-            # 思考階段提示（強化字串型別判定，防止第三方端點回傳空物件導致誤觸發）
+            # 只要任何模型進入思考階段，立即印出提示
             if reasoning_val and isinstance(reasoning_val, str) and reasoning_val.strip() and not thinking_logged:
                 thinking_logged = True
-                logger.info("  💭 [模型深度推理中...]")
+                logger.info(f"  💭 [模型深度推理中 ({effort_val})...]")
 
             if content_val and isinstance(content_val, str):
                 content_parts.append(content_val)
@@ -1748,11 +1855,10 @@ def stream_completion(
     if target_usage_source:
         log_cache_metrics(logger, target_usage_source, action_name=action_name)
 
-    # 準確檢查整個串流歷程是否遭遇長度截斷或安全過濾攔截
     if detected_finish_reason in ["length", "MAX_TOKENS"]:
-        logger.warning("  ⚠️ [輸出截斷警告] 模型輸出觸及 max_tokens (65536) 上限，內容可能不完整！")
+        logger.warning("  ⚠️ [輸出截斷警告] 模型輸出觸及 max_tokens 上限！")
     elif detected_finish_reason in ["safety", "SAFETY", "content_filter"]:
-        logger.warning("  ⚠️ [安全過濾警告] 內容觸發 Gemini 內建安全過濾機制被後端強制截斷！")
+        logger.warning("  ⚠️ [安全過濾警告] 觸發後端安全過濾機制！")
 
     _LAST_API_CALL_TIME = time.time()
     full_output = "".join(content_parts)
@@ -1760,7 +1866,6 @@ def stream_completion(
         logger.info(f"\n{'='*25} 🤖 [AI 原始完整輸出 RAW] {'='*25}\n{full_output}\n{'='*75}\n")
 
     return full_output
-
 
 def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
     """
@@ -1829,14 +1934,20 @@ def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
     if cut_idx != -1:
         if cut_idx < len(remaining_text):
             remaining_text = remaining_text[cut_idx:].strip()
-            remaining_text = re.sub(r"^[，。！？；、：）\)\]】〕＞》〉」』”’\'\"\s　]+", "", remaining_text).strip()
+            # 循環清除開頭的所有標點、引號、空括號對 ()/（）/[]/【】 與孤立開閉括號
+            while True:
+                prev_len = len(remaining_text)
+                # 1. 移除成對的空括號或空校勘符號
+                remaining_text = re.sub(r"^(?:\(\s*\)|（\s*）|\[\s*\]|【\s*】|〔\s*〕|〈\s*〉|《\s*》)", "", remaining_text).strip()
+                # 2. 移除開頭的各類標點、括號、引號、格式符號與空白
+                remaining_text = re.sub(r"^[，。！？；、：—…\(\)（）\[\]【】《》〈〉「」『』\"\'“”‘’◎\<\>#*`_\s　]+", "", remaining_text).strip()
+                if len(remaining_text) == prev_len:
+                    break
 
-            # 安全防護：若剩餘開頭殘留 <=2 個字且均為常見句尾虛助詞/孤立標點，視為已消化完畢，避免卡在單字死循環
+            # 安全防護：僅在剩餘有效純漢字確實為 0 時才判定為消化完畢（完整保留 1~2 字短真言/結語）
             rem_clean = normalize_text(remaining_text)
-            if 0 < len(rem_clean) <= 2:
-                weak_particles = {"者", "也", "耳", "矣", "焉", "哉", "乎", "耶", "兮", "歟", "之"}
-                if all(ch in weak_particles for ch in rem_clean):
-                    remaining_text = ""
+            if len(rem_clean) == 0:
+                remaining_text = ""
             return remaining_text
         else:
             return ""
@@ -1881,7 +1992,7 @@ def generate_sutra_segments(
 
     is_gap_mode = ("經文漏段補齊" in issue_type or "補漏" in issue_type or "全本經文銷文" in issue_type)
 
-    while remaining_text and len(normalize_text(remaining_text)) > 0 and loop_guard < max_loops:
+    while remaining_text and len(normalize_text(remaining_text)) > 2 and loop_guard < max_loops:
         loop_guard += 1
 
         # 簡化呼叫簽名，移除冗餘參數
@@ -1998,7 +2109,34 @@ def fix_single_issue(
                         on_step_done(valid_merge_idx, fixed_block)
                     return fixed_block, valid_merge_idx
 
-    if merge_segs:
+    # ★ 純位置錯位 / 自身完整快速直通（免調用 API，由物理重排引擎自動歸位）
+    has_misplacement_intent = (
+        any(kw in issue_type_str for kw in ["錯位", "錯置", "倒置", "順序", "重排", "移至"])
+        or any(kw in problem_desc for kw in ["序列中錯置", "位置錯置", "順序錯置", "整段移至", "移至第", "移到", "調換順序", "錯位", "錯置"])
+    )
+    is_self_contained = any(kw in problem_desc for kw in [
+        "自身完整", "無須合併", "無須拆分", "無需合併", "無需拆分", "不用重寫", "不需重寫",
+        "整段移至", "逕移", "直接移動"
+    ])
+    if has_misplacement_intent and (is_self_contained or len(valid_merge_idx) == 1):
+        target_idx = valid_merge_idx[0]
+        if output_path and os.path.exists(output_path):
+            _, all_sections = parse_md_sections(output_path)
+            if target_idx < len(all_sections):
+                target_block = all_sections[target_idx]
+                logger.info(
+                    f"  ⚡ [本地極速重排] 段落 [{target_idx}] 自身完整（{issue_type_str}），"
+                    f"將由物理重排演算法自動校準歸位，免除 API 調用！"
+                )
+                if on_step_done and callable(on_step_done):
+                    on_step_done(valid_merge_idx, target_block)
+                return target_block, valid_merge_idx
+
+    # ★ 修正缺陷一：精確區分「漏段重熔」與「純漏段獨立補齊」的切片來源
+    if is_gap_fix and len(valid_merge_idx) == 1 and gap_text:
+        # 單錨點自足漏段：直接以 gap_text 為唯一銷文目標，保護 p_idx 原段不被覆蓋切片
+        combined_raw = gap_text.strip()
+    elif merge_segs:
         combined_raw = get_source_slice(
             sutra_text,
             segments,
@@ -2009,12 +2147,9 @@ def fix_single_issue(
         )
         gap_len = len(normalize_text(gap_text))
         expected_raw_len = sum(len(normalize_text(s)) for s in merge_segs) + gap_len
-        if len(normalize_text(combined_raw)) > max(expected_raw_len * 2 + 100, expected_raw_len + 150) and not (is_head_gap or is_tail_gap or is_gap_fix):
-            logger.warning(
-                f"  ⚠️ 檢測到切片長度異常膨脹 ({len(combined_raw)} 字 vs 預期 {expected_raw_len} 字)，"
-                f"安全回退至段落拼合"
-            )
-            combined_raw = "".join(merge_segs)
+        # 若切片未包含漏段，將漏段安全拼入
+        if gap_text and normalize_text(gap_text) not in normalize_text(combined_raw):
+            combined_raw = f"{combined_raw}\n{gap_text}".strip()
     else:
         combined_raw = gap_text
 
@@ -2056,7 +2191,7 @@ def fix_single_issue(
                     f"為防止經文遺漏，取消直接刪除，交由 AI 重整校準。"
                 )
 
-    # 部分重複智慧裁切
+    # 部分重複智慧裁切（徹底防禦各類否定語意）
     if problem_desc:
         m_keep = re.search(
             r"(?:保留(?:後[一二三四\d]+句)?|(?:直接|本段|應)?(?:自|從|由|起自))"
@@ -2064,14 +2199,24 @@ def fix_single_issue(
             problem_desc
         )
         if m_keep:
-            start_kw = normalize_text(m_keep.group(1))
-            norm_comb = normalize_text(combined_raw)
-            k_pos = norm_comb.find(start_kw)
-            if k_pos > 0:
-                clean_chars_map = [raw_i for raw_i, ch in enumerate(combined_raw) if RE_CLEAN_CHAR.match(ch)]
-                if k_pos < len(clean_chars_map):
-                    combined_raw = combined_raw[clean_chars_map[k_pos]:].strip()
-                    logger.info(f"  ✂️ 依審查建議裁切起點至『{m_keep.group(1)[:15]}...』")
+            # 往前動態截取至前一標點或最多 40 字（涵蓋完整子句語義）
+            start_pos = m_keep.start()
+            lookback_pos = max(0, start_pos - 40)
+            sub_clause = problem_desc[lookback_pos:start_pos]
+            # 若中間有句號/分號，僅取該標點後的當前子句
+            clause_parts = re.split(r"[。；\n]", sub_clause)
+            current_sub_clause = clause_parts[-1]
+
+            is_negated = any(neg in current_sub_clause for neg in ["不", "勿", "毋", "嚴禁", "無須", "無需", "不用", "免", "別", "莫", "切忌"])
+            if not is_negated:
+                start_kw = normalize_text(m_keep.group(1))
+                norm_comb = normalize_text(combined_raw)
+                k_pos = norm_comb.find(start_kw)
+                if k_pos > 0:
+                    clean_chars_map = [raw_i for raw_i, ch in enumerate(combined_raw) if RE_CLEAN_CHAR.match(ch)]
+                    if k_pos < len(clean_chars_map):
+                        combined_raw = combined_raw[clean_chars_map[k_pos]:].strip()
+                        logger.info(f"  ✂️ 依審查建議裁切起點至『{m_keep.group(1)[:15]}...』")
         else:
             m_dup_prefix = re.search(
                 r"(?:首[一二三四\d]+句|重複前段|前段|開頭|首句|前[一二三四\d]+句)"
@@ -2150,6 +2295,21 @@ def fix_single_issue(
 # ============================================================
 #  七、審查與診斷分析引擎
 # ============================================================
+def is_full_gatha_len(n: int) -> bool:
+    """動態判定是否為四言(16)、五言(20)、六言(24)、七言(28)的整偈整倍數"""
+    if n < 16:
+        return False
+    return any(n % (meter * 4) == 0 for meter in (4, 5, 6, 7))
+
+def is_incomplete_gatha_fragment(n: int) -> bool:
+    """動態判定是否為非整偈的韻文殘句（如半偈、單句或三句殘偈）"""
+    if n <= 0:
+        return False
+    for meter in (4, 5, 6, 7):
+        if n % meter == 0 and (n % (meter * 4) != 0) and (n <= meter * 3):
+            return True
+    return False
+    
 def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[str]] = None) -> List[ReviewIssue]:
     """程式化純物理硬傷預檢（碎首/斷尾 + 非整偈 + 格式殘缺 + 全局漏段檢測，回傳 ReviewIssue 清單）"""
     style = detect_punctuation_style(sutra_text)
@@ -2275,7 +2435,7 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             ))
             continue
 
-        # 3. 物理碎首檢測（僅在與前段在經文中實質相鄰時才判定合併，防止跨越漏段誤合併）
+        # 3. 古籍無標點相鄰文字之物理碎首檢測（結合佛學文法詞與整偈韻律智慧辨識）
         prev_start_p = seg_idx_to_pos.get(i - 1, -1) if i > 0 else -1
         prev_seg_end_pos = (prev_start_p + len(normalize_text(segments[i - 1]))) if prev_start_p != -1 else -1
         is_adjacent_to_prev = (pos != -1 and prev_seg_end_pos != -1 and abs(pos - prev_seg_end_pos) <= 1)
@@ -2285,16 +2445,31 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             prev_raw_idx = clean_to_raw[pos - 1]
             intervening = sutra_text[prev_raw_idx + 1 : raw_idx]
             has_sep = bool(re.search(r"[\s\n\r　，。！？；、：—…\(\)（）\[\]【】《》〈〉「」『』\"\'“”‘’◎]", intervening))
+
             if not has_sep:
+                prev_clean_text = normalize_text(segments[i - 1])
                 char_before = sutra_text[prev_raw_idx]
-                if RE_CLEAN_CHAR.match(char_before):
-                    issues.append(ReviewIssue(
-                        index=i - 1,
-                        issue_type="字詞開頭碎首腰斬",
-                        problem=f"本段開頭在詞中被截斷（前字『{char_before}』無標點分隔），應與前段合併",
-                        merge_indices=[i - 1, i],
-                    ))
-                    continue
+
+                # 判定 1：若兩段各自是標準整偈（五言 20 字、七言 28 字），古籍無標點相連完全合法
+                prev_is_full_gatha = is_full_gatha_len(len(prev_clean_text))
+                curr_is_full_gatha = is_full_gatha_len(len(clean_t))
+
+                # 判定 2：檢查是否具備古文自然斷句標誌（前段以句尾詞結尾，或後段以發語詞開頭）
+                has_sentence_end_marker = any(prev_clean_text.endswith(kw) for kw in ["也", "矣", "者", "乎", "哉", "耳", "已", "訖", "云", "言", "說偈言", "說偈曰"])
+                has_sentence_start_marker = any(clean_t.startswith(kw) for kw in ["爾時", "佛告", "復次", "世尊", "時", "是故", "若", "彼", "此", "云何", "何以故", "唯", "善男子", "善女人", "如來", "菩薩", "問曰", "答曰", "論曰"])
+
+                is_naturally_separated = (prev_is_full_gatha and curr_is_full_gatha) or has_sentence_end_marker or has_sentence_start_marker
+
+                # 僅在「非自然分句」且「其中一段過短或處於詞中腰斬」時才通報合併
+                if not is_naturally_separated and (len(clean_t) < 5 or len(prev_clean_text) < 5 or len(prev_clean_text) in [5, 10, 15, 7, 14, 21]):
+                    if RE_CLEAN_CHAR.match(char_before):
+                        issues.append(ReviewIssue(
+                            index=i - 1,
+                            issue_type="字詞開頭碎首腰斬",
+                            problem=f"本段開頭在詞中截斷或韻文未成整偈（前字『{char_before}』無標點），應與前段合併銷文",
+                            merge_indices=[i - 1, i],
+                        ))
+                        continue
 
         # 4. 偈頌末尾合法殘偈保護
         is_gatha_tail = False
@@ -2355,8 +2530,29 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             target_indices = [total - 1] if total > 0 else [0]
             desc = f"經文結尾遺漏了 {len(normalize_text(gap_content))} 字未銷文（『{gap_content[:20]}...』），應補齊末尾段落"
         else:
-            target_indices = [p_idx, p_idx + 1] if p_idx + 1 < total else [p_idx]
-            desc = f"段落 [{p_idx}] 與後文夾縫間遺漏了 {len(normalize_text(gap_content))} 字（『{gap_content[:20]}...』），應由原始經文重新切片補齊"
+            # 智慧判斷：前段是否為未完的「腰斬殘句」或「非整偈韻文」
+            prev_seg = segments[p_idx] if 0 <= p_idx < total else ""
+            prev_clean = normalize_text(prev_seg)
+            gap_clean = normalize_text(gap_content)
+
+            # 檢測前段是否停在未完標點、或是未湊滿整偈的殘偈（動態支援四/五/六/七言）
+            prev_is_incomplete = (
+                prev_seg.rstrip().endswith(("，", "、", "：", "—", "-"))
+                or is_incomplete_gatha_fragment(len(prev_clean))
+                or (len(gap_clean) <= 14 and not gap_content.strip().endswith(("。", "！", "？")))
+            )
+
+            if prev_is_incomplete:
+                # 【情況 1：腰斬殘句】將前段、漏段與後段合流，交由 AI 重新釐定最佳斷句邊界
+                target_indices = [p_idx, p_idx + 1] if p_idx + 1 < total else [p_idx]
+                desc = (
+                    f"段落 [{p_idx}] 結尾未完或屬半偈，與漏段（『{gap_content[:15]}...』）實質割裂，"
+                    f"應合併相鄰段落由 AI 重新銷文斷句"
+                )
+            else:
+                # 【情況 2：自足漏段】前段已完整，僅針對漏段獨立銷文並自然插入
+                target_indices = [p_idx]
+                desc = f"段落 [{p_idx}] 後方遺漏了獨立法義區塊 {len(gap_clean)} 字（『{gap_content[:20]}...』），應獨立補齊"
 
         issues.append(ReviewIssue(
             index=target_indices[0] if (target_indices and target_indices[0] >= 0) else 0,
@@ -2534,18 +2730,16 @@ def merge_overlapping_issues(
     merged_raw = [normalized_items[0]]
     for cur in normalized_items[1:]:
         prev = merged_raw[-1]
-        # 若有重疊或相鄰且總跨度 <= 8 個段落
-        if cur["start"] <= prev["end"] and (max(prev["end"], cur["end"]) - prev["start"] + 1 <= 8):
+        # 1. 若有實質重疊：強制合併以保護檔案結構完整性（即使跨度稍大亦不可留有重疊區間）
+        if cur["start"] <= prev["end"]:
             prev["end"] = max(prev["end"], cur["end"])
             if cur["issue_type"] and cur["issue_type"] not in prev["issue_type"]:
                 prev["issue_type"] = f"{prev['issue_type']}+{cur['issue_type']}"
             if cur["problem"] and cur["problem"] not in prev["problem"]:
                 prev["problem"] = f"{prev['problem']}；{cur['problem']}"
-            # ★ 修復：若兩者皆有漏段文字，必須安全串接，絕不可靜默丟棄後者
             if cur["gap_text"]:
                 if prev["gap_text"]:
                     if cur["gap_text"] not in prev["gap_text"]:
-                        # 檢查交界處是否已有換行或標點，無則自然串接
                         prev["gap_text"] = f"{prev['gap_text']}{cur['gap_text']}".strip()
                 else:
                     prev["gap_text"] = cur["gap_text"]
@@ -2944,14 +3138,14 @@ def run_fix(
     update_md_file(output_path, sutra_text, corrections, segments, logger)
     logger.info(f"\n🎉 修正完成：已重寫更新 {len(corrections)}/{max_fix} 處段落。")
 
-    # ★ 關鍵改善：磁碟結構已更新，舊 Checkpoint 與已執行的審查報告一併清理，防止索引漂移
+    # ★ 關鍵改善：磁碟結構已更新，舊 Checkpoint 清理，並將 review.json 標記為清空完成
     remove_checkpoint(checkpoint_path)
-    if os.path.exists(review_path):
-        try:
-            os.remove(review_path)
-            logger.info(f"🧹 已清理已執行的審查報告快取（{os.path.basename(review_path)}）")
-        except Exception:
-            pass
+    try:
+        with open(review_path, "w", encoding="utf-8") as rf:
+            json.dump([], rf)
+        logger.info(f"✨ 已將審查報告狀態標記為完工清空（{os.path.basename(review_path)}）")
+    except Exception:
+        pass
 
     if is_standalone_fix:
         logger.info("\n" + "=" * 65)
@@ -3050,17 +3244,15 @@ def detect_current_state(
     norm_sutra_len = len(normalize_text(sutra_text))
     covered_chars = max(0, norm_sutra_len - gap_chars)
     coverage_pct = (covered_chars / max(1, norm_sutra_len)) * 100
+    dynamic_gap_threshold = max(25, int(norm_sutra_len * 0.02))
 
-    # ★★★ 3. 優先關鍵判斷：銷文是否中途停止推進（覆蓋率 < 95% 且文末未完時，絕不提前進入修復）★★★
-    tail_gaps = [g for g in gaps if getattr(g, "position", "") == "tail"]
-    tail_gap_chars = sum(len(normalize_text(getattr(g, "gap_text", ""))) for g in tail_gaps)
-
-    if tail_gap_chars >= 25 or (coverage_pct < 95.0 and tail_gap_chars > 0):
+    # ★ 優先關鍵判斷：只要總覆蓋率 < 95% 或漏字超過動態閾值，優先補漏
+    if coverage_pct < 95.0 or gap_chars >= dynamic_gap_threshold:
         logger.info(
-            f"🔍 [狀態感知] 檢測到目前經文覆蓋率為 {coverage_pct:.1f}%，且文末尚有 {tail_gap_chars} 字未產出。\n"
-            f"   👉 智慧判定為【銷文中途停止】，自動無縫接軌繼續推進銷文（不提前調用 AI 審查）！"
+            f"🔍 [狀態感知] 檢測到目前經文覆蓋率為 {coverage_pct:.1f}%（尚缺 {gap_chars} 字未銷文）。\n"
+            f"   👉 智慧判定為【經文未補齊】，優先自動補齊漏段（不提前調用 AI 審查）！"
         )
-        return PipelineState.NEED_GENERATE, {}
+        return PipelineState.NEED_GAP_FILL if coverage_pct >= 85.0 else PipelineState.NEED_GENERATE, {"gaps": gaps}
 
     # 4. 檢查是否有已生成的審查報告（初稿整體完成後才讀取）
     if is_review_json_valid(review_path, output_path, segments):
@@ -3098,7 +3290,7 @@ def run_pipeline(
     output_path: str,
     logger: logging.Logger,
     max_review_cycles: int = 2
-) -> bool:
+) -> Tuple[bool, List[Dict[str, Any]]]:
     logger.info("=" * 68)
     logger.info("🌟 啟動佛經銷文智慧閉環流水線（先審查後修復版）")
     logger.info(f"   經文檔案：{args.file}")
@@ -3110,11 +3302,12 @@ def run_pipeline(
     last_state = None
     last_covered_chars = -1
     stall_count = 0
+    last_review_issues: List[Dict[str, Any]] = []
 
     while True:
         if getattr(client, "key_pool", None) and client.key_pool.is_all_dead():
             logger.error("🛑 檢測到所有 API Key 皆已失效，流水線立即中止！")
-            return False
+            return False, last_review_issues
 
         state, meta = detect_current_state(sutra_text, output_path, logger)
 
@@ -3152,10 +3345,13 @@ def run_pipeline(
             except Exception:
                 pass
             logger.info("\n" + "=" * 68)
-            logger.info("🎉🎉🎉 全流程圓滿完成！經文 100% 全文覆蓋，且已通過因明文法深度審查！")
+            if last_review_issues:
+                logger.info(f"🎉 流水線處理完畢，全文覆蓋完備（但最後審查仍有 {len(last_review_issues)} 處建議待查）。")
+            else:
+                logger.info("🎉🎉🎉 全流程圓滿完成！經文 100% 全文覆蓋，且已通過因明文法深度審查！")
             logger.info(f"最終成果：{output_path}")
             logger.info("=" * 68)
-            return True
+            return True, last_review_issues
 
         elif state == PipelineState.NEED_GENERATE:
             logger.info("\n🚀 === [Stage 1/3] 開始全本初次銷文 ===")
@@ -3167,9 +3363,10 @@ def run_pipeline(
             issues = run_review(args, client, model, sutra_text, segments, style, output_path, logger)
             if issues is None:
                 logger.error("❌ 審查過程遭遇錯誤，流水線已安全暫停。")
-                return False
+                return False, last_review_issues
             if not issues:
                 logger.info("✨ 經審查無任何語意割裂且無漏段，品質極佳！")
+                last_review_issues = []
                 review_path = os.path.splitext(output_path)[0] + "_review.json"
                 try:
                     with open(review_path, "w", encoding="utf-8") as f:
@@ -3177,6 +3374,8 @@ def run_pipeline(
                 except Exception:
                     pass
                 continue
+            else:
+                last_review_issues = issues
 
         elif state in (PipelineState.NEED_REVIEW_FIX, PipelineState.NEED_CHECKPOINT_FIX):
             logger.info("\n🔧 === [Stage 3/3] 依審查報告執行修復與段落校準 ===")
@@ -3184,10 +3383,11 @@ def run_pipeline(
             issues_to_fix = meta.get("issues")
             if issues_to_fix:
                 args.max_fix = max(args.max_fix, len(issues_to_fix))
+                last_review_issues = issues_to_fix
             success = run_fix(args, client, model, sutra_text, segments, output_path, logger, all_issues=issues_to_fix)
             if not success:
                 logger.warning("⚠️ 修復中斷，已保存現有進度。隨時再次執行原指令即可秒級接續。")
-                return False
+                return False, last_review_issues
 
             review_path = os.path.splitext(output_path)[0] + "_review.json"
             if os.path.exists(review_path):
@@ -3221,7 +3421,7 @@ def run_pipeline(
             if stall_count >= 2:
                 logger.error(f"\n❌ [防死鎖警報] 流水線在【{state.value}】階段連續 2 輪無實質進展，安全中止以防止無效循環。")
                 logger.warning(f"👉 請檢查日誌確認 API 餘額與回應狀態，或手動檢視：{output_path}")
-                return False
+                return False, last_review_issues
         else:
             stall_count = 0
 
@@ -3239,7 +3439,13 @@ def find_sutra_md_pairs(
     seen_txts = set()
     seen_mds = set()
 
-    for root, _, files in os.walk(root_dir):
+    # 忽略常見的備份、整理暫存與版本控制目錄
+    ignore_dirs = {".git", ".vscode", "__pycache__", "backup", "bak", "temp", "tmp", "原文_整理"}
+
+    for root, dirs, files in os.walk(root_dir):
+        # 原地過濾忽略目錄，防止遞迴深入
+        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+
         # 1. 優先掃描既有的 *_銷文.md
         for f in files:
             if f.endswith("_銷文.md") and not f.startswith("._") and not f.endswith(".bak"):
@@ -3307,11 +3513,16 @@ def run_batch(
     """★ 遞迴批次自動校對流水線（逐一修至 100% 完工後才換下一檔，具備崩潰隔離與統計報表）"""
     total_files = len(pairs)
     logger.info("=" * 70)
-    logger.info(f"🚀 啟動批次遞迴校對模式，共發現 {total_files} 個匹配的經文檔案組")
+    logger.info(f"🚀 啟動批次遞迴校對模式，共發現 {total_files} 個匹配的經文檔案組：")
+    logger.info("=" * 70)
+    logger.info("📋 掃描到的待處理檔案清單：")
+    for i, (txt_p, md_p) in enumerate(pairs, 1):
+        logger.info(f"   [{i:02d}/{total_files:02d}] 經文: {txt_p}  ➔  銷文: {md_p}")
     logger.info("=" * 70)
 
     success_files: List[str] = []
     failed_files: List[Tuple[str, str]] = []
+    files_with_unresolved_issues: List[Dict[str, Any]] = []
 
     for idx, (txt_path, md_path) in enumerate(pairs, 1):
         md_name = os.path.basename(md_path)
@@ -3358,6 +3569,7 @@ def run_batch(
             is_ok = True
 
             # 依據命令列參數進行多模式動態路由
+            remaining_issues: List[Dict[str, Any]] = []
             if args.generate:
                 run_generate(args, client, model, sutra_text, md_path, file_logger)
                 rem_gaps = find_missing_gaps(sutra_text, extract_segments_from_md(md_path))
@@ -3369,11 +3581,20 @@ def run_batch(
             elif args.review:
                 issues = run_review(args, client, model, sutra_text, segments, style, md_path, file_logger)
                 is_ok = (issues is not None)
+                if issues:
+                    remaining_issues = issues
             elif args.fix or args.dry_run:
                 is_ok = run_fix(args, client, model, sutra_text, segments, md_path, file_logger)
             else:
                 # 預設：全流程自動流水線
-                is_ok = run_pipeline(args, client, model, sutra_text, style, md_path, file_logger)
+                is_ok, remaining_issues = run_pipeline(args, client, model, sutra_text, style, md_path, file_logger)
+
+            if remaining_issues:
+                files_with_unresolved_issues.append({
+                    "file": md_name,
+                    "path": md_path,
+                    "issues": remaining_issues
+                })
 
             if is_ok:
                 success_files.append(md_path)
@@ -3411,7 +3632,25 @@ def run_batch(
     if failed_files:
         logger.info("\n未完工檔案清單：")
         for f_path, reason in failed_files:
-            logger.info(f"   - {os.path.basename(f_path)}: {reason}")
+            # 優先顯示包含父資料夾的相對路徑，避免 2_銷文.md 重複混淆
+            rel_display = os.path.relpath(f_path) if os.path.isabs(f_path) else f_path
+            logger.info(f"   - {rel_display}: {reason}")
+
+    if files_with_unresolved_issues:
+        logger.warning("\n" + "!" * 70)
+        logger.warning(f"⚠️ 【注意】共有 {len(files_with_unresolved_issues)} 個檔案在最後審查輪次仍有問題待處理：")
+        for item in files_with_unresolved_issues:
+            f_name = item["file"]
+            f_issues = item["issues"]
+            logger.warning(f"\n📄 檔案：{f_name}（共 {len(f_issues)} 處待處理問題）")
+            for iss_idx, iss in enumerate(f_issues, 1):
+                m_str = ",".join(map(str, iss.get("merge_indices", [iss.get("index", 0)])))
+                iss_type = iss.get("type") or iss.get("issue_type") or "未知問題"
+                prob = iss.get("problem", "")
+                logger.warning(f"   [{iss_idx:02d}] 段落 [{m_str}] ({iss_type})：{prob}")
+        logger.warning("!" * 70)
+    else:
+        logger.info("\n✨ 所有檔案皆無殘留問題，全數完美通過審查！")
     logger.info("=" * 70)
 
 
@@ -3422,6 +3661,7 @@ def load_api_keys(
     key_file: Optional[str] = None,
     api_key_str: Optional[str] = None,
     is_opencode: bool = False,
+    is_openrouter: bool = False,
     is_free_glm: bool = False,
     is_gemini: bool = False,
     is_nvidia: bool = False
@@ -3450,7 +3690,7 @@ def load_api_keys(
             env_candidates = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]
         elif is_nvidia:
             env_candidates = ["NVIDIA_API_KEY", "NV_API_KEY", "OPENAI_API_KEY"]
-        elif is_free_glm:
+        elif is_free_glm or is_openrouter:
             env_candidates = ["OPENROUTER_API_KEY", "GLM_API_KEY", "OPENAI_API_KEY"]
         elif is_opencode:
             env_candidates = ["OPENCODE_API_KEY", "OPENAI_API_KEY"]
@@ -3471,11 +3711,11 @@ def load_api_keys(
         file_map = {
             "gemini": ["gemini_key.txt", "google_key.txt", "gemini_api_key.txt", "api_key.txt"],
             "nvidia": ["nvidia_key.txt", "nvidia_api_key.txt", "nv_key.txt", "api_key.txt"],
-            "free_glm": ["openrouter_key.txt", "openrouter_api_key.txt", "glm_key.txt", "api_key.txt"],
+            "openrouter": ["openrouter_key.txt", "openrouter_api_key.txt", "openrouter.txt", "or_key.txt", "glm_key.txt", "api_key.txt"],
             "opencode": ["opencode_key.txt", "opencode_api_key.txt", "api_key.txt"],
             "deepseek": ["api_key.txt", "deepseek_key.txt", "deepseek_api_key.txt", "key.txt"],
         }
-        category = "gemini" if is_gemini else ("nvidia" if is_nvidia else ("free_glm" if is_free_glm else ("opencode" if is_opencode else "deepseek")))
+        category = "gemini" if is_gemini else ("nvidia" if is_nvidia else ("openrouter" if (is_openrouter or is_free_glm) else ("opencode" if is_opencode else "deepseek")))
         candidate_filenames = file_map[category]
 
         cwd_dir = os.getcwd()
@@ -3504,11 +3744,11 @@ def load_api_keys(
     return ApiKeyPool(keys)
 
 def auto_output_path(input_file: str) -> str:
-    """自動推導 MD 檔路徑（自動淨化 _經文/_原典 後綴，與批次模式命名 100% 同步）"""
+    """自動推導 MD 檔路徑（自動淨化 _經文/_原典/_銷文 後綴，防止重複堆疊）"""
     input_abs = os.path.abspath(input_file)
     input_dir = os.path.dirname(input_abs)
     base_name = os.path.splitext(os.path.basename(input_abs))[0]
-    for suffix in ["_經文", "_原典", "_原文"]:
+    for suffix in ["_經文", "_原典", "_原文", "_銷文"]:
         if base_name.endswith(suffix):
             base_name = base_name[:-len(suffix)]
             break
@@ -3531,6 +3771,11 @@ PROVIDER_DEFAULTS = {
         "default_model": "z-ai/glm-5.2:free",
         "name": "OpenRouter Free GLM",
     },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "stealth/ox-alpha",
+        "name": "OpenRouter API",
+    },
     "nvidia": {
         "base_url": "https://integrate.api.nvidia.com/v1",
         "default_model": "z-ai/glm-5.2",
@@ -3543,7 +3788,7 @@ PROVIDER_DEFAULTS = {
     },
     "zen": {
         "base_url": "https://opencode.ai/zen/v1",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "x-preview-f-free",
         "name": "OpenCode Zen 按量端點",
     },
 }
@@ -3561,7 +3806,7 @@ def main():
         description="DeepSeek 佛經銷文斷句品質深度審查、一鍵修正與專注補漏工具（智慧流水線版）"
     )
     parser.add_argument("--file", type=str, default=None, help="原始經文 txt 檔案路徑（單檔模式）")
-    parser.add_argument("--recursive", "--batch-dir", "--batch", type=str, nargs="?", const=".", default=None, help="★ 遞迴批次模式：指定搜尋目錄（預設當前目錄 .），自動找出所有 *_銷文.md 逐一校驗修正完工")
+    parser.add_argument("--recursive", "--batch-dir", "--batch", type=str, nargs="*", default=None, help="★ 遞迴批次模式：可指定一至多個搜尋目錄（未指定則預設當前目錄 .），自動找出所有檔案逐一校驗")
     parser.add_argument("--output", type=str, default=None, help="目標銷文 md 檔案路徑（預設自動推導）")
 
     # 模式互斥群組
@@ -3580,14 +3825,17 @@ def main():
     provider_group.add_argument("--free-glm", "--glm5", "--glm", action="store_const", dest="provider", const="free_glm", help="★ 使用 OpenRouter Free GLM 免費模型端點")
     provider_group.add_argument("--opencode", "--go", action="store_const", dest="provider", const="opencode", help="★ 使用 OpenCode Go 訂閱端點")
     provider_group.add_argument("--zen", action="store_const", dest="provider", const="zen", help="使用 OpenCode Zen 按量計費端點")
+    provider_group.add_argument("--openrouter", action="store_const", dest="provider", const="openrouter", help="使用 OpenRouter 端點")
     parser.set_defaults(provider="deepseek")
 
+    parser.add_argument("--ox", "--ox-opencode", nargs="?", const="x-preview-f-free", type=str, default=None, help="★ 使用 OpenCode Zen / Go Ox Alpha 模型 (預設 x-preview-f-free)")
+    parser.add_argument("--ox-stealth", "--ox-or", "--ox-alpha", "--alpha", nargs="?", const="stealth/ox-alpha", type=str, default=None, help="★ 使用 OpenRouter Stealth Ox-Alpha 模型 (預設 stealth/ox-alpha，端點走 OpenRouter)")
     parser.add_argument("--dry-run", action="store_true", help="預覽待修清單，不呼叫 API 且不更動檔案（配合 --fix 使用）")
     parser.add_argument("--debug", action="store_true", help="★ 開啟除錯輸出，即時印出每一次產出的完整原始內容 (Raw Output)")
     parser.add_argument("--reset", "--clean", action="store_true", help="強制清除關聯的 checkpoint 與 review 快取檔")
     parser.add_argument("--model", type=str, default=None, help="呼叫模型名稱（若未指定則根據 Provider 自動匹配最佳預設）")
-    parser.add_argument("--reasoning-effort", type=str, default="high", choices=["low", "medium", "high"])
-    parser.add_argument("--max-review-cycles", type=int, default=5, help="AI 審查與修復的最大交替輪次（防死循環）")
+    parser.add_argument("--reasoning-effort", type=str, default="max", choices=["low", "medium", "high", "max"])
+    parser.add_argument("--max-review-cycles", type=int, default=2, help="AI 審查與修復的最大交替輪次（防死循環，建議設為 2）")
     parser.add_argument("--max-fix", type=int, default=50, help="單次最多修正問題數")
     parser.add_argument("--timeout", type=int, default=300, help="單次 API 超時時間（秒）")
     parser.add_argument("--base-url", type=str, default=None, help="自訂 API Base URL")
@@ -3601,9 +3849,37 @@ def main():
     if not any([args.generate, args.fix_gaps, args.review, args.fix]):
         args.auto = True
 
-    is_batch_mode = bool(args.recursive)
+    is_batch_mode = (args.recursive is not None)
     main_log_path = "batch_sutra_review.log" if is_batch_mode else os.path.splitext(args.output or auto_output_path(args.file))[0] + "_review_log.txt"
     logger = setup_logger(main_log_path)
+
+    # 快捷模型覆寫
+    if args.ox_stealth:
+        ox_val = args.ox_stealth.strip()
+        if not ("/" in ox_val):
+            ox_val = f"stealth/{ox_val}"
+        args.model = ox_val
+        args.provider = "openrouter"
+    elif args.ox:
+        ox_val = args.ox.strip()
+        if "stealth" in ox_val.lower() or ox_val.lower() in ["or", "openrouter"]:
+            args.model = "stealth/ox-alpha"
+            args.provider = "openrouter"
+        elif ox_val in ["ox", "ox-alpha", "ox-alpha-free", "alpha", "opencode", "zen"]:
+            args.model = "x-preview-f-free"
+            if args.provider not in ["opencode", "zen"]:
+                args.provider = "zen"
+        else:
+            args.model = ox_val
+            if args.provider not in ["opencode", "zen", "openrouter"]:
+                args.provider = "zen"
+
+    # OpenCode API 端點要求純模型 ID (不可包含 opencode/ 或 opencode-go/ 前綴)
+    if args.model:
+        if args.model.startswith("opencode/"):
+            args.model = args.model[len("opencode/"):]
+        elif args.model.startswith("opencode-go/"):
+            args.model = args.model[len("opencode-go/"):]
 
     # 取得提供商預設參數
     p_info = PROVIDER_DEFAULTS[args.provider]
@@ -3628,6 +3904,7 @@ def main():
         key_file=args.api_key_file,
         api_key_str=args.api_key,
         is_opencode=(args.provider in ["opencode", "zen"]),
+        is_openrouter=(args.provider in ["free_glm", "openrouter"]),
         is_free_glm=(args.provider == "free_glm"),
         is_gemini=(args.provider == "gemini"),
         is_nvidia=(args.provider == "nvidia")
@@ -3644,14 +3921,28 @@ def main():
     client.key_pool = key_pool
     client.debug_mode = args.debug
 
-    # 批次遞迴處理路由
+    # 批次遞迴處理路由（支援多目錄掃描與跨目錄去重）
     if is_batch_mode:
-        search_dir = os.path.abspath(args.recursive)
-        pairs = find_sutra_md_pairs(search_dir, logger=logger, for_generate=(args.generate or args.auto))
-        if not pairs:
-            logger.warning(f"⚠️ 在目錄 {search_dir} 下未找到任何匹配的 *_銷文.md 與 .txt 經文檔案組合！")
+        target_dirs = args.recursive if len(args.recursive) > 0 else ["."]
+        all_pairs = []
+        seen_mds = set()
+
+        for d in target_dirs:
+            search_dir = os.path.abspath(d)
+            if not os.path.exists(search_dir):
+                logger.warning(f"⚠️ 指定的目錄不存在，已跳過：{search_dir}")
+                continue
+            pairs = find_sutra_md_pairs(search_dir, logger=logger, for_generate=(args.generate or args.auto))
+            for txt_p, md_p in pairs:
+                abs_md = os.path.abspath(md_p)
+                if abs_md not in seen_mds:
+                    seen_mds.add(abs_md)
+                    all_pairs.append((txt_p, md_p))
+
+        if not all_pairs:
+            logger.warning(f"⚠️ 在指定的所有目錄中未找到任何匹配的經文與銷文檔案組合！")
             return
-        run_batch(args, client, model_name, pairs, logger)
+        run_batch(args, client, model_name, all_pairs, logger)
         return
 
     # 單檔模式處理路由
@@ -3679,7 +3970,16 @@ def main():
 
     # 單檔模式路由
     if args.auto:
-        run_pipeline(args, client, model_name, sutra_text, style, args.output, logger)
+        is_ok, remaining_issues = run_pipeline(args, client, model_name, sutra_text, style, args.output, logger)
+        if remaining_issues:
+            logger.warning("\n" + "!" * 70)
+            logger.warning(f"⚠️ 【注意】本檔案在最後審查輪次仍殘留 {len(remaining_issues)} 處問題：")
+            for iss_idx, iss in enumerate(remaining_issues, 1):
+                m_str = ",".join(map(str, iss.get("merge_indices", [iss.get("index", 0)])))
+                iss_type = iss.get("type") or iss.get("issue_type") or "未知問題"
+                prob = iss.get("problem", "")
+                logger.warning(f"   [{iss_idx:02d}] 段落 [{m_str}] ({iss_type})：{prob}")
+            logger.warning("!" * 70)
     elif args.generate:
         run_generate(args, client, model_name, sutra_text, args.output, logger)
     elif args.fix_gaps:
