@@ -1746,7 +1746,7 @@ def stream_completion(
 
     is_third_party_or_free = (
         ":free" in model.lower()
-        or "glm" in model.lower()
+        or ("glm" in model.lower() and "opencode" not in str(client.base_url).lower())
         or "gemini" in model.lower()
         or "dots" in model.lower()
         or "openrouter" in str(client.base_url).lower()
@@ -1759,6 +1759,8 @@ def stream_completion(
         max_tokens_val = 512000
     elif "nvidia" in str(getattr(client, "base_url", "")).lower():
         max_tokens_val = 16384
+    elif "glm-5.3" in m_lower:
+        max_tokens_val = 131072
     elif "glm-5.2" in m_lower or "glm" in m_lower:
         max_tokens_val = 150000
     elif "muse" in m_lower or "spark" in m_lower:
@@ -4086,6 +4088,7 @@ def main():
     provider_group.add_argument("--openrouter", action="store_const", dest="provider", const="openrouter", help="使用 OpenRouter 端點")
     parser.set_defaults(provider="deepseek")
 
+    parser.add_argument("--glm53-flash", "--glm53", "--glm-flash", action="store_true", help="★ 使用 OpenCode Go GLM-5.3-Flash 模型 (glm-5.3-flash)")
     parser.add_argument("--ox", "--ox-opencode", nargs="?", const="x-preview-f-free", type=str, default=None, help="★ 使用 OpenCode Zen / Go Ox Alpha 模型 (預設 x-preview-f-free)")
     parser.add_argument("--ox-stealth", "--ox-or", "--ox-alpha", "--alpha", nargs="?", const="stealth/ox-alpha", type=str, default=None, help="★ 使用 OpenRouter Stealth Ox-Alpha 模型 (預設 stealth/ox-alpha，端點走 OpenRouter)")
     parser.add_argument("--dry-run", action="store_true", help="預覽待修清單，不呼叫 API 且不更動檔案（配合 --fix 使用）")
@@ -4112,7 +4115,10 @@ def main():
     logger = setup_logger(main_log_path)
 
     # 快捷模型覆寫
-    if args.ox_stealth:
+    if getattr(args, "glm53_flash", False):
+        args.model = "glm-5.3-flash"
+        args.provider = "opencode"
+    elif args.ox_stealth:
         ox_val = args.ox_stealth.strip()
         if not ("/" in ox_val):
             ox_val = f"stealth/{ox_val}"
