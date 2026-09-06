@@ -23,6 +23,10 @@ sutra.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏�
   python sutra.py --file 1.txt --review --opencode # 使用 OpenCode 僅審查並產出 review.json
   python sutra.py --file 1.txt --fix --opencode    # 使用 OpenCode 依 review.json 修正
   python sutra.py --file 1.txt --fix --dry-run     # 預覽待修正清單（不呼叫 API）
+
+  ★ 遞迴批次模式平行處理（--parallel 預設 = 本機硬體執行緒數量，傳 1 可改回依序處理）：
+  python sutra.py --recursive . --parallel 4       # ★ 4 路平行同時校對多個檔案
+  python sutra.py --recursive D:/藏經目錄 --parallel 1   # 強制回到依序逐一處理
 """
 
 import os
@@ -30,11 +34,13 @@ import re
 import sys
 import json
 import time
+import copy
 import shutil
 import logging
 import argparse
 from enum import Enum
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import List, Dict, Tuple, Optional, Any, Callable, Set
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 from dataclasses import dataclass, field
@@ -3733,6 +3739,132 @@ def find_sutra_md_pairs(
     return pairs
 
 
+def _process_batch_file(
+    args: argparse.Namespace,
+    base_url: Optional[str],
+    timeout: Any,
+    model: str,
+    key_pool: Any,
+    debug_mode: bool,
+    txt_path: str,
+    md_path: str,
+    idx: int,
+    total_files: int,
+    logger: logging.Logger,
+    completed_set: Set[str],
+) -> Dict[str, Any]:
+    """★ 批次單檔處理核心（平行模式每個工作緒獨立執行：各自建立 OpenAI Client 並複製 args，杜絕共享狀態競態）"""
+    md_name = os.path.basename(md_path)
+    md_abs = os.path.abspath(md_path)
+
+    # 防禦性再次檢查：提交與真正執行之間，該檔可能已由其他執行緒完工
+    if md_abs in completed_set:
+        return {
+            "idx": idx, "md_path": md_path, "md_abs": md_abs, "md_name": md_name,
+            "status": "skipped", "is_ok": True, "issues": [], "reason": "",
+        }
+
+    # ★ 平行安全 1：每個 worker 建立獨立 OpenAI Client（共用同一個金鑰池輪換），避免多緒共用單一 Client
+    worker_client = OpenAI(
+        api_key=key_pool.get_current_key() if key_pool else "",
+        base_url=base_url,
+        timeout=timeout,
+    )
+    worker_client.key_pool = key_pool
+    worker_client.debug_mode = debug_mode
+
+    # ★ 平行安全 2：複製 args 命名空間，避免並行處理時互相覆寫 args.file / args.output / args.max_fix
+    worker_args = copy.copy(args)
+    worker_args.file = txt_path
+    worker_args.output = md_path
+
+    result: Dict[str, Any] = {
+        "idx": idx, "md_path": md_path, "md_abs": md_abs, "md_name": md_name,
+        "status": "failed", "is_ok": False, "issues": [], "reason": "",
+    }
+
+    logger.info("\n\n" + "#" * 70)
+    logger.info(f"📂 [批次進度 {idx}/{total_files}] 開始校對：{md_name}")
+    logger.info(f"   經文原檔：{txt_path}")
+    logger.info(f"   銷文檔案：{md_path}")
+    logger.info("#" * 70 + "\n")
+
+    try:
+        with open(txt_path, "r", encoding="utf-8-sig") as f:
+            sutra_text = f.read().strip()
+    except Exception as e:
+        err_msg = f"讀取經文檔案失敗: {e}"
+        logger.error(f"❌ {err_msg} ({txt_path})")
+        result["status"] = "read_error"
+        result["reason"] = err_msg
+        return result
+
+    if not sutra_text:
+        err_msg = "經文檔案為空"
+        logger.warning(f"⚠️ {err_msg} ({txt_path})")
+        result["status"] = "empty"
+        result["reason"] = err_msg
+        return result
+
+    style = detect_punctuation_style(sutra_text)
+    file_log_path = os.path.splitext(md_path)[0] + "_review_log.txt"
+    file_logger = setup_logger(file_log_path, logger_name=f"file_logger_{idx}")
+
+    # 批次模式支援 --reset 清理當前待處理檔案的暫存快取（已完工檔案前面已被跳過，不受影響）
+    if getattr(worker_args, "reset", False):
+        for p in [os.path.splitext(md_path)[0] + "_checkpoint.json", os.path.splitext(md_path)[0] + "_review.json"]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    file_logger.info(f"🧹 已清除快取檔：{os.path.basename(p)}")
+                except Exception:
+                    pass
+
+    try:
+        segments = extract_segments_from_md(md_path)
+        is_ok = True
+
+        # 依據命令列參數進行多模式動態路由
+        remaining_issues: List[Dict[str, Any]] = []
+        if worker_args.generate:
+            run_generate(worker_args, worker_client, model, sutra_text, md_path, file_logger)
+            rem_gaps = find_missing_gaps(sutra_text, extract_segments_from_md(md_path))
+            is_ok = (len(rem_gaps) == 0)
+        elif worker_args.fix_gaps:
+            run_fix_gaps(worker_args, worker_client, model, sutra_text, segments, style, md_path, file_logger)
+            rem_gaps = find_missing_gaps(sutra_text, extract_segments_from_md(md_path))
+            is_ok = (len(rem_gaps) == 0)
+        elif worker_args.review:
+            issues = run_review(worker_args, worker_client, model, sutra_text, segments, style, md_path, file_logger)
+            is_ok = (issues is not None)
+            if issues:
+                remaining_issues = issues
+        elif worker_args.fix or worker_args.dry_run:
+            is_ok = run_fix(worker_args, worker_client, model, sutra_text, segments, md_path, file_logger)
+        else:
+            # 預設：全流程自動流水線
+            is_ok, remaining_issues = run_pipeline(worker_args, worker_client, model, sutra_text, style, md_path, file_logger)
+
+        result["is_ok"] = is_ok
+        result["issues"] = remaining_issues or []
+        result["status"] = "success" if (is_ok and not remaining_issues) else "failed"
+    except Exception as file_exc:
+        err_msg = str(file_exc)
+        logger.error(f"❌ [批次進度 {idx}/{total_files}] 檔案處理失敗: {err_msg}")
+        result["status"] = "failed"
+        result["reason"] = err_msg
+    finally:
+        # 關閉單檔日誌 Handler 釋放 Windows 檔案鎖定
+        for h in file_logger.handlers[:]:
+            try:
+                h.close()
+                file_logger.removeHandler(h)
+            except Exception:
+                pass
+
+    return result
+
+
 def run_batch(
     args: argparse.Namespace,
     client: OpenAI,
@@ -3740,7 +3872,7 @@ def run_batch(
     pairs: List[Tuple[str, str]],
     logger: logging.Logger
 ) -> None:
-    """★ 遞迴批次自動校對流水線（逐一修至 100% 完工後才換下一檔，具備崩潰隔離與統計報表）"""
+    """★ 遞迴批次自動校對流水線（支援 --parallel 平行處理；逐一修至 100% 完工後才換下一檔，具備崩潰隔離與統計報表）"""
     total_files = len(pairs)
     logger.info("=" * 70)
     logger.info(f"🚀 啟動批次遞迴校對模式，共發現 {total_files} 個匹配的經文檔案組：")
@@ -3767,116 +3899,125 @@ def run_batch(
     failed_files: List[Tuple[str, str]] = []
     files_with_unresolved_issues: List[Dict[str, Any]] = []
 
-    for idx, (txt_path, md_path) in enumerate(pairs, 1):
-        md_name = os.path.basename(md_path)
-        md_abs = os.path.abspath(md_path)
+    # ★ 平行處理參數（--parallel / --workers；未指定時預設 = 本機硬體執行緒數量，傳 1 即依序逐一處理）
+    default_workers = os.cpu_count() or 1
+    workers = max(1, int(getattr(args, "parallel", None) or default_workers))
+    if workers > 1:
+        logger.info(f"⚡ 已啟用平行處理：{workers} 個工作緒同時並行校對 {total_files} 個檔案")
 
-        # ★ 批次中斷續傳跳過機制
-        if md_abs in completed_set:
-            logger.info(f"⚡ [批次跳過 {idx:02d}/{total_files:02d}] 檔案先前已完工，直接略過：{md_name}")
+    # 平行模式共用配置（每個 worker 會在 _process_batch_file 內獨立建立 OpenAI Client）
+    base_url = getattr(client, "base_url", None)
+    timeout = getattr(client, "timeout", 300)
+    key_pool = getattr(client, "key_pool", None)
+    debug_mode = getattr(client, "debug_mode", False)
+
+    # 統一於主執行緒記錄單檔結果（平行模式下 Checkpoint 僅由主執行緒寫入，杜絕檔案寫入競態）
+    def record_result(res: Dict[str, Any]) -> None:
+        idx = res.get("idx", 0)
+        md_path = res["md_path"]
+        md_name = res["md_name"]
+        md_abs = res["md_abs"]
+        status = res["status"]
+
+        if status == "skipped":
             success_files.append(md_path)
-            continue
+            return
 
-        logger.info("\n\n" + "#" * 70)
-        logger.info(f"📂 [批次進度 {idx}/{total_files}] 開始校對：{md_name}")
-        logger.info(f"   經文原檔：{txt_path}")
-        logger.info(f"   銷文檔案：{md_path}")
-        logger.info("#" * 70 + "\n")
+        if status in ("read_error", "empty"):
+            failed_files.append((md_path, res["reason"]))
+            return
 
-        try:
-            with open(txt_path, "r", encoding="utf-8-sig") as f:
-                sutra_text = f.read().strip()
-        except Exception as e:
-            err_msg = f"讀取經文檔案失敗: {e}"
-            logger.error(f"❌ {err_msg} ({txt_path})")
-            failed_files.append((md_path, err_msg))
-            continue
+        issues = res["issues"] or []
+        if issues:
+            files_with_unresolved_issues.append({
+                "file": md_name,
+                "path": md_path,
+                "issues": issues
+            })
 
-        if not sutra_text:
-            err_msg = "經文檔案為空"
-            logger.warning(f"⚠️ {err_msg} ({txt_path})")
-            failed_files.append((md_path, err_msg))
-            continue
+        if res["is_ok"] and not issues:
+            success_files.append(md_path)
+            completed_set.add(md_abs)
+            save_batch_checkpoint({"completed": list(completed_set)})
+            logger.info(f"✨ [批次進度 {idx}/{total_files}] 檔案處理完成（AI 複審 0 問題）：{md_name}")
+        else:
+            reason = res["reason"] or (
+                f"尚有 {len(issues)} 處問題未通過複審" if issues else "處理中途停滯或 API 異常中斷"
+            )
+            failed_files.append((md_path, reason))
+            logger.warning(f"⚠️ [批次進度 {idx}/{total_files}] 檔案未完全完工或殘留問題，不記入 Checkpoint：{md_name}")
 
-        style = detect_punctuation_style(sutra_text)
-        file_log_path = os.path.splitext(md_path)[0] + "_review_log.txt"
-        file_logger = setup_logger(file_log_path, logger_name=f"file_logger_{idx}")
+    def process_file(idx: int, txt_path: str, md_path: str) -> Dict[str, Any]:
+        return _process_batch_file(
+            args=args,
+            base_url=base_url,
+            timeout=timeout,
+            model=model,
+            key_pool=key_pool,
+            debug_mode=debug_mode,
+            txt_path=txt_path,
+            md_path=md_path,
+            idx=idx,
+            total_files=total_files,
+            logger=logger,
+            completed_set=completed_set,
+        )
 
-        args.file = txt_path
-        args.output = md_path
+    # ── 平行路由：workers == 1 維持原始逐檔迴圈；workers > 1 以 ThreadPoolExecutor 逐波提交 ──
+    if workers <= 1:
+        for idx, (txt_path, md_path) in enumerate(pairs, 1):
+            md_name = os.path.basename(md_path)
+            md_abs = os.path.abspath(md_path)
 
-        # 批次模式支援 --reset 清理當前待處理檔案的暫存快取（已完工檔案前面已被跳過，不受影響）
-        if getattr(args, "reset", False):
-            for p in [os.path.splitext(md_path)[0] + "_checkpoint.json", os.path.splitext(md_path)[0] + "_review.json"]:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                        file_logger.info(f"🧹 已清除快取檔：{os.path.basename(p)}")
-                    except Exception:
-                        pass
-
-        try:
-            segments = extract_segments_from_md(md_path)
-            is_ok = True
-
-            # 依據命令列參數進行多模式動態路由
-            remaining_issues: List[Dict[str, Any]] = []
-            if args.generate:
-                run_generate(args, client, model, sutra_text, md_path, file_logger)
-                rem_gaps = find_missing_gaps(sutra_text, extract_segments_from_md(md_path))
-                is_ok = (len(rem_gaps) == 0)
-            elif args.fix_gaps:
-                run_fix_gaps(args, client, model, sutra_text, segments, style, md_path, file_logger)
-                rem_gaps = find_missing_gaps(sutra_text, extract_segments_from_md(md_path))
-                is_ok = (len(rem_gaps) == 0)
-            elif args.review:
-                issues = run_review(args, client, model, sutra_text, segments, style, md_path, file_logger)
-                is_ok = (issues is not None)
-                if issues:
-                    remaining_issues = issues
-            elif args.fix or args.dry_run:
-                is_ok = run_fix(args, client, model, sutra_text, segments, md_path, file_logger)
-            else:
-                # 預設：全流程自動流水線
-                is_ok, remaining_issues = run_pipeline(args, client, model, sutra_text, style, md_path, file_logger)
-
-            if remaining_issues:
-                files_with_unresolved_issues.append({
-                    "file": md_name,
-                    "path": md_path,
-                    "issues": remaining_issues
-                })
-
-            if is_ok and not remaining_issues:
+            # ★ 批次中斷續傳跳過機制
+            if md_abs in completed_set:
+                logger.info(f"⚡ [批次跳過 {idx:02d}/{total_files:02d}] 檔案先前已完工，直接略過：{md_name}")
                 success_files.append(md_path)
-                completed_set.add(md_abs)
+                continue
+
+            try:
+                res = process_file(idx, txt_path, md_path)
+                record_result(res)
+            except KeyboardInterrupt:
+                logger.warning("\n🛑 接收到使用者中斷信號 (Ctrl+C)，立即保存批次進度並退出批次任務。")
                 save_batch_checkpoint({"completed": list(completed_set)})
-                logger.info(f"✨ [批次進度 {idx}/{total_files}] 檔案處理完成（AI 複審 0 問題）：{md_name}")
-            else:
-                reason = f"尚有 {len(remaining_issues)} 處問題未通過複審" if remaining_issues else "處理中途停滯或 API 異常中斷"
-                failed_files.append((md_path, reason))
-                logger.warning(f"⚠️ [批次進度 {idx}/{total_files}] 檔案未完全完工或殘留問題，不記入 Checkpoint：{md_name}")
+                raise
+
+            # 批次熔斷檢查：只有當金鑰池中的所有 Key 全部都死光時，才真正中斷批次任務
+            if key_pool and key_pool.is_all_dead():
+                logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！立即停止後續所有檔案處理。")
+                break
+    else:
+        # ★ 平行模式：以「每一波 = workers 個檔案」的方式提交，主執行緒等待並記錄結果，波間執行熔斷檢查
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                pos = 0
+                while pos < len(pairs):
+                    wave_end = min(pos + workers, len(pairs))
+                    futures = []
+                    for w_idx in range(pos, wave_end):
+                        txt_path, md_path = pairs[w_idx]
+                        actual_idx = w_idx + 1
+                        md_abs = os.path.abspath(md_path)
+                        # 批次中斷續傳跳過機制（於提交前檢查，避免重複處理已完工檔案）
+                        if md_abs in completed_set:
+                            logger.info(f"⚡ [批次跳過 {actual_idx:02d}/{total_files:02d}] 檔案先前已完工，直接略過：{os.path.basename(md_path)}")
+                            success_files.append(md_path)
+                            continue
+                        futures.append(executor.submit(process_file, actual_idx, txt_path, md_path))
+
+                    for fut in futures:
+                        record_result(fut.result())
+
+                    # 每波結束後執行批次熔斷檢查，防止金鑰池全滅後繼續空轉
+                    if key_pool and key_pool.is_all_dead():
+                        logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！立即停止後續所有檔案處理。")
+                        break
+                    pos = wave_end
         except KeyboardInterrupt:
             logger.warning("\n🛑 接收到使用者中斷信號 (Ctrl+C)，立即保存批次進度並退出批次任務。")
             save_batch_checkpoint({"completed": list(completed_set)})
             raise
-        except Exception as file_exc:
-            err_msg = str(file_exc)
-            logger.error(f"❌ [批次進度 {idx}/{total_files}] 檔案處理失敗: {err_msg}")
-            failed_files.append((md_path, err_msg))
-        finally:
-            # 關閉單檔日誌 Handler 釋放 Windows 檔案鎖定
-            for h in file_logger.handlers[:]:
-                try:
-                    h.close()
-                    file_logger.removeHandler(h)
-                except Exception:
-                    pass
-
-        # 批次熔斷檢查：只有當金鑰池中的所有 Key 全部都死光時，才真正中斷批次任務
-        if getattr(client, "key_pool", None) and client.key_pool.is_all_dead():
-            logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！立即停止後續所有檔案處理。")
-            break
 
     # ★ 全數完工時自動清理批次進度記錄檔
     if len(success_files) == total_files:
@@ -4067,6 +4208,7 @@ def main():
     )
     parser.add_argument("--file", type=str, default=None, help="原始經文 txt 檔案路徑（單檔模式）")
     parser.add_argument("--recursive", "--batch-dir", "--batch", type=str, nargs="*", default=None, help="★ 遞迴批次模式：可指定一至多個搜尋目錄（未指定則預設當前目錄 .），自動找出所有檔案逐一校驗")
+    parser.add_argument("--parallel", "--workers", type=int, default=None, help="★ 平行處理工作緒數（僅遞迴批次模式生效；預設 = 本機硬體執行緒數量，傳 1 可改回依序逐一處理）")
     parser.add_argument("--output", type=str, default=None, help="目標銷文 md 檔案路徑（預設自動推導）")
 
     # 模式互斥群組
