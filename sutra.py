@@ -24,9 +24,9 @@ sutra.py — 佛經銷文斷句品質深度審查、一鍵修正與專注補漏�
   python sutra.py --file 1.txt --fix --opencode    # 使用 OpenCode 依 review.json 修正
   python sutra.py --file 1.txt --fix --dry-run     # 預覽待修正清單（不呼叫 API）
 
-  ★ 遞迴批次模式平行處理（--parallel 預設 = 本機硬體執行緒數量，傳 1 可改回依序處理）：
+  ★ 遞迴批次模式平行處理（--parallel 預設關閉 = 依序逐一處理，需手動啟用）：
   python sutra.py --recursive . --parallel 4       # ★ 4 路平行同時校對多個檔案
-  python sutra.py --recursive D:/藏經目錄 --parallel 1   # 強制回到依序逐一處理
+  python sutra.py --recursive D:/藏經目錄          # 未指定 --parallel：依序逐一處理
 """
 
 import os
@@ -37,10 +37,11 @@ import time
 import copy
 import shutil
 import logging
+import difflib
 import argparse
 from enum import Enum
 from typing import List, Dict, Tuple, Optional, Any, Callable, Set
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from openai import OpenAI
 
 from dataclasses import dataclass, field
@@ -283,7 +284,7 @@ RE_CODE_FENCE_CLOSE = re.compile(r"\n?\s*```\s*$", re.MULTILINE)
 # ★ 全域統一 Markdown 段落切分正則（嚴格錨定行首標題結構與冒號/引號/閉括號，防止正文引用誤切斷）
 SECTION_SPLIT_REGEX = re.compile(
     r"(?:\n\s*---\s*\n|(?<=\n)(?=(?:[\s#*`>]*【當前經文進度】|"
-    r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*)[\s*`>]*原典[\s*`_】\]\)]*[：:「『\"'“\n])))"
+    r"[\s#*`>]*【單句銷文】|(?:[\s#*`>]*🔹|【\s*🔹?\s*|#{1,4}\s*(?:🔹\s*)?)[\s*`>]*原典[\s*`_】\]\)]*[：:\s\n「『\"'“])))"
 )
 
 # 統一古異體字至標準通行字（單向歸一化至大藏經通行正體字）
@@ -473,8 +474,8 @@ def extract_sentence(raw_content: str) -> Optional[str]:
     search_area = block_match.group(1) if block_match else raw_content
 
     fallback_patterns = [
-        rf"(?:[\s#*`>]*原典[\s*`>]*[：:]|[【［]\s*原典\s*[】］][：:]?)\s*([\s\S]*?){lookahead_boundary}",
-        rf"(?:[\s#*`>]*經文[\s*`>]*[：:]|[【［]\s*經文\s*[】］][：:]?)\s*([\s\S]*?){lookahead_boundary}",
+        rf"(?:[\s#*`>]*原典[\s*`>]*[：:\n]|[【［]\s*原典\s*[】］][：:]?)\s*([\s\S]*?){lookahead_boundary}",
+        rf"(?:[\s#*`>]*經文[\s*`>]*[：:\n]|[【［]\s*經文\s*[】］][：:]?)\s*([\s\S]*?){lookahead_boundary}",
     ]
     for pat in fallback_patterns:
         m = re.search(pat, search_area)
@@ -581,7 +582,7 @@ def verify_sentence_quality(
     if any(sym in sentence_text for sym in ["（中略）", "...", "…", "中略", "[中略]"]):
         return False, "包含省略號", "絕對禁止使用省略號，請完整引用經文。"
 
-    # 3. 起點對齊檢查（具備發語詞/重複主詞/短起點智慧容錯）
+    # 3. 起點對齊檢查（具備發語詞/重複主詞/短起點智慧容錯，並容許底本缺字符號與校勘位移）
     match_pos = clean_rem.find(clean_s_text) if clean_s_text else -1
     min_check_len = min(len(clean_s_text), len(clean_rem), 4)
     prefix_match = (
@@ -589,7 +590,14 @@ def verify_sentence_quality(
         and clean_s_text[:min_check_len] == clean_rem[:min_check_len]
     )
 
-    if match_pos != 0 and not prefix_match:
+    # 動態容許 1 字增刪位移（如 AI 自動填補古籍闕字或底本脫漏校勘標記）
+    check_w = min(len(clean_s_text), len(clean_rem), 6)
+    direct_common = sum(1 for a, b in zip(clean_s_text[:check_w], clean_rem[:check_w]) if a == b) if check_w > 0 else 0
+    shift_common_1 = sum(1 for a, b in zip(clean_s_text[1:check_w], clean_rem[:check_w - 1]) if a == b) if check_w >= 3 else 0
+    shift_common_2 = sum(1 for a, b in zip(clean_s_text[:check_w - 1], clean_rem[1:check_w]) if a == b) if check_w >= 3 else 0
+    is_fuzzy_start = (check_w >= 3 and (max(direct_common, shift_common_1, shift_common_2) / (check_w - 1 if max(shift_common_1, shift_common_2) > direct_common else check_w)) >= 0.65)
+
+    if match_pos != 0 and not prefix_match and not is_fuzzy_start:
         rem_prefix_6 = clean_rem[: min(6, len(clean_rem))]
         s_pos = clean_s_text.find(rem_prefix_6) if rem_prefix_6 else -1
         if 0 <= s_pos <= 10:
@@ -866,7 +874,7 @@ def get_sutra_coverage(sutra_text: str, completed_sentences: List[str]) -> Tuple
             if is_prefix_fallback and len(s_norm) > 0:
                 target_window = norm_sutra[pos:end_pos]
                 matching_chars = sum(1 for a, b in zip(s_norm, target_window) if a == b)
-                if (matching_chars / len(s_norm)) < 0.65:
+                if (matching_chars / len(s_norm)) < 0.60:
                     continue
 
             new_cover = sum(1 for i in range(pos, end_pos) if not covered_mask[i])
@@ -1008,6 +1016,10 @@ def get_source_slice(
     if not sentence_slots and not force_head and not force_tail:
         return "".join(target_segments)
 
+    has_any_slot = any(i in sentence_slots for i in range(start_seg_idx, end_seg_idx + 1))
+    if not has_any_slot and not force_head and not force_tail:
+        return "".join(target_segments)
+
     if force_head:
         start_clean_pos = 0
     elif start_seg_idx in sentence_slots:
@@ -1097,12 +1109,12 @@ def find_best_position(raw_target: str, section_text: Optional[str], clean_sutra
             positions.append(idx)
             start = idx + 1
 
-    if not positions and len(norm_target) >= 4:
-        # 通用滑動種子探測（無硬編碼）：若開頭存在異體字或出入，以 4 字種子多點探測最佳對齊窗口
+    if not positions and len(norm_target) >= 3:
+        # 通用滑動種子探測（無硬編碼）：改以 3 字種子探測，容許短句內部存在單一異體字或缺字符號
         target_len = len(norm_target)
         n_len = len(norm_sutra)
-        seed_len = min(4, target_len)
-        step = max(1, min(4, target_len // 4))
+        seed_len = min(3, target_len)
+        step = max(1, min(3, target_len // 3))
         cand_scores = {}
 
         for offset in range(0, max(1, target_len - seed_len + 1), step):
@@ -1417,41 +1429,44 @@ def reorder_markdown_by_sutra(md_content: str, sutra_text: str) -> str:
             valid_matches = []
             for pos in matches:
                 target_window = norm_sutra[pos: min(pos + len(norm_s), n)]
-                matching_chars = sum(1 for a, b in zip(norm_s, target_window) if a == b)
-                if len(norm_s) > 0 and (matching_chars / len(norm_s)) >= 0.65:
+                ratio = difflib.SequenceMatcher(None, norm_s, target_window).ratio()
+                if ratio >= 0.60:
                     valid_matches.append(pos)
             matches = valid_matches
 
         if not matches:
-            # ★ 修復：依原始段落索引在全文中的相對位置進行線性插值，避免被丟到檔案末尾
-            estimated_pos = int((item.get("orig_idx", 0) / max(1, len(section_items))) * n)
-            assigned_sections.append({
-                "pos": estimated_pos,
-                "orig_idx": item.get("orig_idx", 0),
-                "sec": item.get("sec", ""),
-                "norm_s": norm_s,
-            })
+            item["best_pos"] = -1
             continue
 
+        expected_pos = int((item.get("orig_idx", 0) / max(1, len(section_items))) * n)
         best_pos = matches[0]
-        min_overlap = float("inf")
+        min_score = float("inf")
         for pos in matches:
             end_pos = min(pos + len(norm_s), n)
             overlap = sum(coverage_count[i] for i in range(pos, end_pos))
-            if overlap < min_overlap:
-                min_overlap = overlap
+            dist = abs(pos - expected_pos)
+            # 綜合評分：槽位重疊度懲罰 + 相對順序距離懲罰，徹底防止相同排比句全部擠在第一個槽位
+            score = overlap * 100.0 + (dist / max(1, n)) * 20.0
+            if score < min_score:
+                min_score = score
                 best_pos = pos
 
         end_pos = min(best_pos + len(norm_s), n)
         for i in range(best_pos, end_pos):
             coverage_count[i] += 1
 
-        assigned_sections.append({
-            "pos": best_pos,
-            "orig_idx": item.get("orig_idx", 0),
-            "sec": item.get("sec", ""),
-            "norm_s": norm_s,
-        })
+        item["best_pos"] = best_pos
+
+    # 為未匹配段落就近吸附錨定前段槽位，保持原始文脈連續，嚴禁線性比例散佈全篇
+    first_known_pos = next((it["best_pos"] for it in section_items if it.get("best_pos", -1) != -1), 0)
+    curr_pos = first_known_pos
+    for it in section_items:
+        if it.get("best_pos", -1) != -1:
+            curr_pos = it["best_pos"]
+            it["pos"] = curr_pos
+        else:
+            it["pos"] = curr_pos
+        assigned_sections.append(it)
 
     assigned_sections.sort(key=lambda x: (x["pos"], x["orig_idx"]))
 
@@ -1942,11 +1957,8 @@ def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
     if len(norm_rem) <= len(norm_sent):
         return ""
 
-    suffix_len = min(6, len(norm_sent))
-    if suffix_len == 0:
+    if not norm_sent:
         return remaining_text
-
-    norm_suffix = norm_sent[-suffix_len:]
 
     clean_to_raw = []
     clean_chars = []
@@ -1957,13 +1969,23 @@ def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
 
     norm_rem_str = normalize_text("".join(clean_chars))
     suffix_matches = []
-    start_search = 0
-    while True:
-        idx = norm_rem_str.find(norm_suffix, start_search)
-        if idx == -1:
+    actual_suffix_len = 0
+
+    # 6 ➔ 5 ➔ 4 ➔ 3 字階梯退避尋找後綴錨點，防止末尾標點或字符出入導致指針失配
+    for s_try in range(min(6, len(norm_sent)), 2, -1):
+        norm_suffix = norm_sent[-s_try:]
+        start_search = 0
+        cand_matches = []
+        while True:
+            idx = norm_rem_str.find(norm_suffix, start_search)
+            if idx == -1:
+                break
+            cand_matches.append(idx)
+            start_search = idx + 1
+        if cand_matches:
+            suffix_matches = cand_matches
+            actual_suffix_len = s_try
             break
-        suffix_matches.append(idx)
-        start_search = idx + 1
 
     open_brackets = set("「『“‘（([【〔<《〈")
     trailing_chars = set(" \t\r\n　，。！？；、：—…」』”’）)]】〕>》〉")
@@ -1974,8 +1996,8 @@ def advance_text_pointer(remaining_text: str, extracted_sentence: str) -> str:
         expected_end = (s_match_pos + len(norm_sent)) if s_match_pos >= 0 else len(norm_sent)
         best_norm_end = min(
             suffix_matches,
-            key=lambda p: abs((p + suffix_len) - expected_end)
-        ) + suffix_len
+            key=lambda p: abs((p + actual_suffix_len) - expected_end)
+        ) + actual_suffix_len
 
         if best_norm_end < len(clean_to_raw):
             raw_cut = clean_to_raw[best_norm_end - 1] + 1
@@ -2216,9 +2238,11 @@ def fix_single_issue(
         next_seg_text = merge_segs[-1].strip()
         combined_raw = f"{gap_text}\n{next_seg_text}".strip()
         logger.info(f"  🔗 [AI 裁決合流後句] 依審查建議，已將漏段與後段 [{last_idx}] 合併為整單元重熔！")
-    elif is_gap_fix and len(valid_merge_idx) == 1 and gap_text and not wants_pull_prev and len(normalize_text(gap_text)) >= 18:
-        # 只有當 AI 未指示合流且漏段篇幅足夠自足時，才作為獨立單元
-        combined_raw = gap_text.strip()
+    elif is_gap_fix and len(valid_merge_idx) == 1 and gap_text and not wants_pull_prev:
+        # 漏段無論多長，因寫回檔案時會佔用 first_idx 槽位，必須與前段 [first_idx] 安全合流重熔，杜絕舊段落被 pop 覆蓋丟失
+        prev_seg_text = merge_segs[0].strip()
+        combined_raw = f"{prev_seg_text}\n{gap_text}".strip()
+        logger.info(f"  🔗 [安全合流防刪] 為防止原段落 [{first_idx}] 被覆蓋丟失，已自動與漏段合併為整單元推進！")
     elif merge_segs:
         combined_raw = get_source_slice(
             sutra_text,
@@ -2242,14 +2266,13 @@ def fix_single_issue(
     # 確保清除殘留的編輯註記前綴（如 段首、句首 等）
     combined_raw = re.sub(r"^(?:(?:第[一二三四五六七八九十\d]+[段句]|段首|段末|句首|本段|本句)[：:「『\"'“\s]*)", "", combined_raw).strip()
 
-    # ★ 動態擴展覆蓋區間：若切片文本（如88字完整文脈）向後融攝了相鄰段落或重複段落，
-    # 自動將被涵蓋的後續段落一併納入 valid_merge_idx，確保整段文意完整重熔且舊段落乾淨替換
+    # ★ 動態擴展覆蓋區間：僅在長經文（>= 25 字）且後續段落長度充足（>= 15 字）確實完全包含時才擴展，防止誤吞短排比正文
     norm_comb = normalize_text(combined_raw)
     expanded_merge_idx = list(valid_merge_idx)
     scan_start = (valid_merge_idx[-1] + 1) if valid_merge_idx else 0
     for next_i in range(scan_start, len(segments)):
         seg_norm = normalize_text(segments[next_i])
-        if seg_norm and seg_norm in norm_comb:
+        if seg_norm and len(seg_norm) >= 15 and seg_norm in norm_comb and len(norm_comb) >= 25:
             expanded_merge_idx.append(next_i)
         else:
             break
@@ -2277,12 +2300,13 @@ def fix_single_issue(
         if has_delete_intent and not has_partial_keep:
             norm_target = normalize_text(combined_raw)
             norm_sutra = normalize_text(sutra_text)
-            # ★ 若原文完全沒有這段字（經外贅段/非本經文），直接安全刪除，不需檢查他處備份
+            # ★ 縮減比對微塊至 4 字，防止短句因微小字詞差異被本地直通誤殺刪除
+            chunk_len = min(4, len(norm_target))
             has_sutra_chunk = any(
-                norm_target[k : k + 6] in norm_sutra
-                for k in range(0, max(1, len(norm_target) - 5), 3)
-            ) if len(norm_target) >= 6 else (norm_target in norm_sutra)
-            is_extraneous = (len(norm_target) >= 6 and not has_sutra_chunk)
+                norm_target[k : k + chunk_len] in norm_sutra
+                for k in range(0, max(1, len(norm_target) - chunk_len + 1), 2)
+            ) if len(norm_target) >= chunk_len else (norm_target in norm_sutra)
+            is_extraneous = (len(norm_target) >= chunk_len and not has_sutra_chunk)
 
             # 統計該文本在原文與現有段落中的出現次數，避免刪除原典合法的重複經句
             sample_prefix = norm_target[: min(15, len(norm_target))]
@@ -2421,10 +2445,10 @@ def is_full_gatha_len(n: int) -> bool:
     return any(n % (meter * 4) == 0 for meter in (4, 5, 6, 7))
 
 def is_incomplete_gatha_fragment(n: int) -> bool:
-    """動態判定是否為非整偈的韻文殘句（如半偈、單句或三句殘偈）"""
+    """動態判定是否為非整偈的韻文殘句（僅限五言 5/10/15、六言 6/12/18、七言 7/14/21 韻文；四言為通用漢譯散文對仗駢句，不可視為殘偈）"""
     if n <= 0:
         return False
-    for meter in (4, 5, 6, 7):
+    for meter in (5, 6, 7):
         if n % meter == 0 and (n % (meter * 4) != 0) and (n <= meter * 3):
             return True
     return False
@@ -2470,8 +2494,12 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
                     dup_orig_idx = seen_segment_positions[pos]
                     dup_prev_seg = segments[dup_orig_idx].strip() if (0 <= dup_orig_idx < len(segments)) else ""
                     dup_prev_norm = normalize_text(dup_prev_seg)
-                    # ★ 雙重驗證：確認當前段落與原段落內容確實高度重疊，防止不同短句因位置相近被誤判
-                    if dup_prev_norm and (clean_t[:10] in dup_prev_norm or dup_prev_norm[:10] in clean_t):
+                    # ★ 雙重驗證：真正的重複必須是全段內容高度實質一致（字符吻合率 >= 80%），嚴禁僅憑前 10 字前綴相同誤殺排比定型句
+                    max_l = max(len(clean_t), len(dup_prev_norm))
+                    common_c = sum(1 for a, b in zip(clean_t, dup_prev_norm) if a == b)
+                    is_true_dup = (max_l > 0 and (common_c / max_l) >= 0.80) or (clean_t == dup_prev_norm)
+
+                    if dup_prev_norm and is_true_dup:
                         issues.append(ReviewIssue(
                             index=i,
                             issue_type="重複內容",
@@ -2497,7 +2525,7 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             if overlap_len >= 8 and (overlap_len / max(1, len(clean_t)) >= 0.7 or len(clean_t) <= 25):
                 dup_str = clean_t[:overlap_len]
                 count_in_sutra = norm_sutra.count(dup_str) if len(dup_str) < 15 else norm_sutra.count(dup_str[:15])
-                if count_in_sutra <= 1:
+                if pos != -1 and count_in_sutra <= 1:
                     issues.append(ReviewIssue(
                         index=i,
                         issue_type="重複內容",
@@ -2511,21 +2539,6 @@ def pre_check(sutra_text: str, segments: List[str], md_sections: Optional[List[s
             or raw_seg.strip().endswith("品")
         ) and len(clean_t) <= 30 and not any(p in raw_seg for p in ["。", "！", "？", "；"])
         is_annotation = bool(re.match(r"^[\(（\[【〔〈《].*?[\)）\]】〕〉》]$", raw_seg.strip())) and len(clean_t) <= 30
-
-        # ★ 本地自動檢測經外贅段：必須全段皆無足夠長度之經文片段匹配，防止前綴單字出入造成誤殺
-        has_sutra_chunk = any(
-            clean_t[k : k + 6] in norm_sutra
-            for k in range(0, max(1, len(clean_t) - 5), 3)
-        ) if len(clean_t) >= 6 else (clean_t in norm_sutra)
-
-        if pos == -1 and len(clean_t) >= 6 and not has_sutra_chunk and not (is_title or is_annotation):
-            issues.append(ReviewIssue(
-                index=i,
-                issue_type="經外贅段",
-                problem=f"本段原典「{clean_t[:15]}...」在經文原文中完全不存在，為經外贅段，應直接刪除",
-                merge_indices=[i],
-            ))
-            continue
 
         clauses = [
             RE_CLEAN_CJK.sub("", c)
@@ -2892,8 +2905,9 @@ def merge_overlapping_issues(
     merged_raw = [normalized_items[0]]
     for cur in normalized_items[1:]:
         prev = merged_raw[-1]
-        # 1. 若有實質重疊：強制合併以保護檔案結構完整性（即使跨度稍大亦不可留有重疊區間）
-        if cur["start"] <= prev["end"]:
+        # 1. 若有實質重疊且合併後總跨度不超過 3 段：安全合併；若跨度過大則獨立保留交由下一輪迭代處理
+        can_merge_span = (max(prev["end"], cur["end"]) - prev["start"] + 1) <= 3
+        if cur["start"] <= prev["end"] and can_merge_span:
             prev["end"] = max(prev["end"], cur["end"])
             if cur["issue_type"] and cur["issue_type"] not in prev["issue_type"]:
                 prev["issue_type"] = f"{prev['issue_type']}+{cur['issue_type']}"
@@ -3494,7 +3508,7 @@ def detect_current_state(
             f"🔍 [狀態感知] 檢測到目前經文覆蓋率為 {coverage_pct:.1f}%（尚缺 {gap_chars} 字未銷文）。\n"
             f"   👉 智慧判定為【經文未補齊】，優先自動補齊漏段（不提前調用 AI 審查）！"
         )
-        return PipelineState.NEED_GAP_FILL if coverage_pct >= 85.0 else PipelineState.NEED_GENERATE, {"gaps": gaps}
+        return PipelineState.NEED_GAP_FILL, {"gaps": gaps}
 
     # 4. 檢查是否有已生成的審查報告（初稿整體完成後才讀取）
     if is_review_json_valid(review_path, output_path, segments):
@@ -3899,9 +3913,8 @@ def run_batch(
     failed_files: List[Tuple[str, str]] = []
     files_with_unresolved_issues: List[Dict[str, Any]] = []
 
-    # ★ 平行處理參數（--parallel / --workers；未指定時預設 = 本機硬體執行緒數量，傳 1 即依序逐一處理）
-    default_workers = os.cpu_count() or 1
-    workers = max(1, int(getattr(args, "parallel", None) or default_workers))
+    # ★ 平行處理參數（--parallel / --workers；未指定時預設關閉 = 依序逐一處理，手動傳 2 以上才啟用平行）
+    workers = max(1, int(getattr(args, "parallel", None) or 1))
     if workers > 1:
         logger.info(f"⚡ 已啟用平行處理：{workers} 個工作緒同時並行校對 {total_files} 個檔案")
 
@@ -3988,33 +4001,47 @@ def run_batch(
                 logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！立即停止後續所有檔案處理。")
                 break
     else:
-        # ★ 平行模式：以「每一波 = workers 個檔案」的方式提交，主執行緒等待並記錄結果，波間執行熔斷檢查
+        # ★ 平行模式：動態滑動窗口提交，已完工檔案瞬間跳過，未完工檔案保持滿額 5 路並行
+        pending: Dict[Any, int] = {}
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                pos = 0
-                while pos < len(pairs):
-                    wave_end = min(pos + workers, len(pairs))
-                    futures = []
-                    for w_idx in range(pos, wave_end):
-                        txt_path, md_path = pairs[w_idx]
-                        actual_idx = w_idx + 1
-                        md_abs = os.path.abspath(md_path)
-                        # 批次中斷續傳跳過機制（於提交前檢查，避免重複處理已完工檔案）
-                        if md_abs in completed_set:
-                            logger.info(f"⚡ [批次跳過 {actual_idx:02d}/{total_files:02d}] 檔案先前已完工，直接略過：{os.path.basename(md_path)}")
-                            success_files.append(md_path)
-                            continue
-                        futures.append(executor.submit(process_file, actual_idx, txt_path, md_path))
+                for actual_idx, (txt_path, md_path) in enumerate(pairs, 1):
+                    md_abs = os.path.abspath(md_path)
 
-                    for fut in futures:
-                        record_result(fut.result())
+                    # 批次中斷續傳跳過機制：已完工檔案瞬間略過，不阻塞主執行緒
+                    if md_abs in completed_set:
+                        logger.info(f"⚡ [批次跳過 {actual_idx:02d}/{total_files:02d}] 檔案先前已完工，直接略過：{os.path.basename(md_path)}")
+                        success_files.append(md_path)
+                        continue
 
-                    # 每波結束後執行批次熔斷檢查，防止金鑰池全滅後繼續空轉
+                    # 批次熔斷檢查：所有金鑰耗盡時停止派發新任務
                     if key_pool and key_pool.is_all_dead():
-                        logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！立即停止後續所有檔案處理。")
+                        logger.critical("\n🛑 [批次熔斷] 所有 API 金鑰已全數耗盡欠費！停止提交新檔案。")
                         break
-                    pos = wave_end
+
+                    # 若當前併發任務已達 workers 上限，等待至少一個任務完成再繼續派發
+                    while len(pending) >= workers:
+                        done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            record_result(fut.result())
+                            pending.pop(fut, None)
+
+                    # 派發未完工檔案至工作緒池
+                    fut = executor.submit(process_file, actual_idx, txt_path, md_path)
+                    pending[fut] = actual_idx
+
+                # 等待剩餘正在執行的所有任務完成
+                for fut in as_completed(list(pending.keys())):
+                    record_result(fut.result())
+                    pending.pop(fut, None)
         except KeyboardInterrupt:
+            # ★ 此刻 with 區塊已 shutdown(wait=True) 等待所有 worker 收工，成果皆已落盤；
+            #   將所有尚未記錄的結果逐一補記，中斷後已完工檔案不會被重跑
+            for fut in list(pending):
+                try:
+                    record_result(fut.result())
+                except BaseException:
+                    pass
             logger.warning("\n🛑 接收到使用者中斷信號 (Ctrl+C)，立即保存批次進度並退出批次任務。")
             save_batch_checkpoint({"completed": list(completed_set)})
             raise
@@ -4208,7 +4235,7 @@ def main():
     )
     parser.add_argument("--file", type=str, default=None, help="原始經文 txt 檔案路徑（單檔模式）")
     parser.add_argument("--recursive", "--batch-dir", "--batch", type=str, nargs="*", default=None, help="★ 遞迴批次模式：可指定一至多個搜尋目錄（未指定則預設當前目錄 .），自動找出所有檔案逐一校驗")
-    parser.add_argument("--parallel", "--workers", type=int, default=None, help="★ 平行處理工作緒數（僅遞迴批次模式生效；預設 = 本機硬體執行緒數量，傳 1 可改回依序逐一處理）")
+    parser.add_argument("--parallel", "--workers", type=int, default=None, help="★ 平行處理工作緒數（僅遞迴批次模式生效；預設關閉 = 依序逐一處理，手動傳 2 以上即多檔同時校對）")
     parser.add_argument("--output", type=str, default=None, help="目標銷文 md 檔案路徑（預設自動推導）")
 
     # 模式互斥群組
